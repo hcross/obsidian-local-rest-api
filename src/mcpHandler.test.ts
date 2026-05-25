@@ -90,7 +90,7 @@ function makeMockOps() {
     deleteVaultFile: jest.fn().mockResolvedValue(undefined),
     searchJsonLogic: jest
       .fn()
-      .mockResolvedValue([{ filename: "a.md", result: true }]),
+      .mockResolvedValue({ results: [{ filename: "a.md", result: true }], truncated: false }),
     simpleSearch: jest
       .fn()
       .mockResolvedValue([{ filename: "a.md", score: 1, matches: [] }]),
@@ -538,9 +538,10 @@ describe("McpHandler", () => {
     const query = { in: ["myTag", { var: "tags" }] };
     const result = await cb({ query });
     expect(ops.searchJsonLogic).toHaveBeenCalledWith(query);
-    expect(parseText(result)).toEqual(
+    expect(parseText(result).results).toEqual(
       expect.arrayContaining([expect.objectContaining({ filename: "a.md" })]),
     );
+    expect(parseText(result).truncated).toBe(false);
   });
 
   // ---- search_simple ------------------------------------------------------

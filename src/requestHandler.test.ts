@@ -1696,6 +1696,52 @@ describe("requestHandler", () => {
         .send({ "==": [{ var: "path" }, "note.md"] })
         .expect(401);
     });
+
+    describe("regexp operator — ReDoS protection (C-01)", () => {
+      beforeEach(() => {
+        const file = new TFile();
+        file.path = "note.md";
+        app.vault._markdownFiles = [file];
+        app.vault._cachedRead = "hello world";
+        const cache = new CachedMetadata();
+        app.metadataCache.getFileCache = () => cache;
+      });
+
+      test("accepts a safe pattern and matches correctly", async () => {
+        const result = await request(server)
+          .post("/search/")
+          .set("Authorization", `Bearer ${API_KEY}`)
+          .set("Content-Type", "application/vnd.olrapi.jsonlogic+json")
+          .send({ regexp: ["^hello", { var: "content" }] })
+          .expect(200);
+
+        expect(result.body).toHaveLength(1);
+        expect(result.body[0].filename).toBe("note.md");
+      });
+
+      test("rejects a classic ReDoS pattern (a+)+$", async () => {
+        const result = await request(server)
+          .post("/search/")
+          .set("Authorization", `Bearer ${API_KEY}`)
+          .set("Content-Type", "application/vnd.olrapi.jsonlogic+json")
+          .send({ regexp: ["(a+)+$", { var: "content" }] })
+          .expect(400);
+
+        expect(result.body.message).toMatch(/unsafe|ReDoS/i);
+      });
+
+      test("rejects a pattern exceeding 500 characters", async () => {
+        const longPattern = "a".repeat(501);
+        const result = await request(server)
+          .post("/search/")
+          .set("Authorization", `Bearer ${API_KEY}`)
+          .set("Content-Type", "application/vnd.olrapi.jsonlogic+json")
+          .send({ regexp: [longPattern, { var: "content" }] })
+          .expect(400);
+
+        expect(result.body.message).toMatch(/length/i);
+      });
+    });
   });
 
   describe("/mcp/ routes", () => {

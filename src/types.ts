@@ -149,6 +149,11 @@ export interface SearchJsonResponseItem {
   result: unknown;
 }
 
+export interface SearchJsonResponse {
+  results: SearchJsonResponseItem[];
+  truncated: boolean;
+}
+
 export interface FileMetadataObject {
   tags: string[];
   frontmatter: Record<string, unknown>;

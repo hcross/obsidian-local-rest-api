@@ -28,6 +28,7 @@ import {
   FileMetadataObject,
   LocalRestApiSettings,
   PeriodicNoteInterface,
+  SearchJsonResponse,
   SearchJsonResponseItem,
 } from "./types";
 import {
@@ -54,9 +55,41 @@ import {
   VaultOperations,
 } from "./vaultOperations";
 import { McpHandler } from "./mcpHandler";
+import { AuditLogger } from "./auditLogger";
+import { sanitizeError } from "./errorUtils";
 
 // Import openapi.yaml as a string
 import openapiYaml from "../docs/openapi.yaml";
+
+// --- In-memory rate limiting for authentication failures (H-04) ---
+interface FailureRecord { count: number; lockedUntil?: number; }
+const authFailures = new Map<string, FailureRecord>();
+const MAX_FAILURES = 5;
+const COOLDOWN_MS = 30_000;
+
+function checkRateLimit(ip: string): void {
+  const now = Date.now();
+  const record = authFailures.get(ip) ?? { count: 0 };
+  if (record.lockedUntil && now < record.lockedUntil) {
+    const retryAfter = Math.ceil((record.lockedUntil - now) / 1000);
+    throw Object.assign(new Error("Too many failed attempts"), { statusCode: 429, retryAfter });
+  }
+}
+
+function recordAuthFailure(ip: string): void {
+  const record = authFailures.get(ip) ?? { count: 0 };
+  record.count += 1;
+  if (record.count >= MAX_FAILURES) {
+    record.lockedUntil = Date.now() + COOLDOWN_MS;
+    record.count = 0;
+  }
+  authFailures.set(ip, record);
+}
+
+function recordAuthSuccess(ip: string): void {
+  authFailures.delete(ip);
+}
+// ------------------------------------------------------------------
 
 export default class RequestHandler {
   app: App;
@@ -70,6 +103,7 @@ export default class RequestHandler {
 
   operations: VaultOperations;
   mcpHandler: McpHandler;
+  auditLogger: AuditLogger;
 
   constructor(
     app: App,
@@ -85,6 +119,8 @@ export default class RequestHandler {
     this.publicApiExtensionRouter = express.Router();
     this.operations = new VaultOperations(this.app);
     this.mcpHandler = new McpHandler(this.operations, this.settings);
+    const vaultPath = (this.app.vault.adapter as { basePath?: string }).basePath ?? "";
+    this.auditLogger = new AuditLogger(vaultPath);
 
     this.api.set("json spaces", 2);
   }
@@ -138,14 +174,34 @@ export default class RequestHandler {
       "/openapi.yaml",
     ];
 
-    if (
-      !authenticationExemptRoutes.includes(req.path) &&
-      !this.requestIsAuthenticated(req)
-    ) {
-      this.returnCannedResponse(res, {
-        errorCode: ErrorCode.ApiKeyAuthorizationRequired,
-      });
-      return;
+    if (!authenticationExemptRoutes.includes(req.path)) {
+      const ip = req.ip ?? req.socket.remoteAddress ?? "unknown";
+
+      // Check rate limit before evaluating the token
+      try {
+        checkRateLimit(ip);
+      } catch (err) {
+        const e = err as { statusCode?: number; retryAfter?: number };
+        if (e.statusCode === 429) {
+          res.set("Retry-After", String(e.retryAfter ?? 30));
+          this.returnCannedResponse(res, {
+            statusCode: 429,
+            message: (err as Error).message,
+          });
+          return;
+        }
+        throw err;
+      }
+
+      if (!this.requestIsAuthenticated(req)) {
+        recordAuthFailure(ip);
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.ApiKeyAuthorizationRequired,
+        });
+        return;
+      }
+
+      recordAuthSuccess(ip);
     }
 
     next();
@@ -592,7 +648,7 @@ export default class RequestHandler {
       } else if (e instanceof PatchFailed) {
         this.returnCannedResponse(res, { errorCode: ErrorCode.PatchFailed, message: e.reason });
       } else {
-        this.returnCannedResponse(res, { statusCode: 500, message: (e as Error).message });
+        this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file") });
       }
     }
   }
@@ -653,7 +709,7 @@ export default class RequestHandler {
       } else if (e instanceof PatchFailed) {
         this.returnCannedResponse(res, { errorCode: ErrorCode.PatchFailed, message: (e).reason });
       } else {
-        this.returnCannedResponse(res, { statusCode: 500, message: (e as Error).message });
+        this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file section") });
       }
     }
   }
@@ -839,10 +895,9 @@ export default class RequestHandler {
           errorCode: ErrorCode.DestinationAlreadyExists,
         });
       } else {
-        const msg = error instanceof Error ? error.message : String(error);
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.FileOperationFailed,
-          message: `Failed to move file: ${msg}`,
+          message: sanitizeError(error, "move file"),
         });
       }
     }
@@ -1260,7 +1315,7 @@ export default class RequestHandler {
       } else {
         this.returnCannedResponse(res, {
           statusCode: 500,
-          message: err instanceof Error ? err.message : String(err),
+          message: sanitizeError(err, "execute command"),
         });
       }
       return;
@@ -1289,7 +1344,7 @@ export default class RequestHandler {
     } catch (e) {
       console.error("Could not prepare simple search: ", e);
       return this.returnCannedResponse(res, {
-        message: `${e}`,
+        message: sanitizeError(e, "simple search"),
         errorCode: ErrorCode.ErrorPreparingSimpleSearch,
       });
     }
@@ -1310,7 +1365,7 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const handlers: Record<string, () => Promise<SearchJsonResponseItem[]>> = {
+    const handlers: Record<string, () => Promise<SearchJsonResponse>> = {
       [ContentTypes.jsonLogic]: async () => {
         return this.operations.searchJsonLogic(req.body);
       },
@@ -1330,13 +1385,16 @@ export default class RequestHandler {
     }
 
     try {
-      const results = await handlers[contentType]();
+      const { results, truncated } = await handlers[contentType]();
+      if (truncated) {
+        res.setHeader("X-Obsidian-Search-Truncated", "true");
+      }
       res.json(results);
     } catch (e) {
       const error = e as Error;
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.InvalidFilterQuery,
-        message: `${error.message}`,
+        message: sanitizeError(error, "search query"),
       });
       return;
     }
@@ -1407,7 +1465,7 @@ export default class RequestHandler {
     }
     this.returnCannedResponse(res, {
       statusCode: 500,
-      message: err.message,
+      message: sanitizeError(err, "internal server error"),
     });
     return;
   }
@@ -1431,11 +1489,69 @@ export default class RequestHandler {
       }
       next();
     });
+    // --- Structured audit logging middleware (M-04) ---
+    this.api.use((req, res, next) => {
+      const startMs = Date.now();
+      const requestId = (req.headers['x-request-id'] as string | undefined)
+        ?? (Math.random().toString(36).substring(2, 10) + Date.now().toString(36));
+      req.headers['x-request-id'] = requestId;
+      res.setHeader('X-Request-ID', requestId);
+
+      const authHeader = req.get(this.settings.authorizationHeaderName ?? 'Authorization') ?? '';
+      const bearerMatch = /^Bearer (.+)$/i.exec(authHeader);
+      const tokenHash = bearerMatch ? this.auditLogger.hashToken(bearerMatch[1]) : '';
+
+      res.on('finish', () => {
+        void this.auditLogger.log({
+          ts: new Date().toISOString(),
+          requestId,
+          method: req.method,
+          path: req.path,
+          status: res.statusCode,
+          tokenHash,
+          durationMs: Date.now() - startMs,
+        });
+      });
+      next();
+    });
+    // --------------------------------------------------
     this.api.use(responseTime());
-    this.api.use(cors({ methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE"] }));
+    const CORS_OPTIONS: cors.CorsOptions = {
+      origin: ['app://obsidian.md', 'capacitor://localhost', 'http://localhost'],
+      methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE"],
+    };
+
+    this.api.use(cors(CORS_OPTIONS));
+
+    this.api.use((req, res, next) => {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      res.setHeader('Content-Security-Policy', "default-src 'none'");
+      if (req.secure) {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+      }
+      next();
+    });
+
+    // L-02: Request correlation ID middleware — runs before auth so every
+    // request (including rejected ones) carries a traceable ID. Accepts a
+    // client-supplied X-Request-ID only when it is a valid UUID v4 string
+    // (36-char hex+dash); otherwise generates a fresh cryptographic UUID via
+    // the Web Crypto API available in Electron/Obsidian without a Node import.
+    this.api.use((req, res, next) => {
+      const clientId = req.headers["x-request-id"];
+      const requestId =
+        typeof clientId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientId)
+          ? clientId
+          : globalThis.crypto.randomUUID();
+      req.headers["x-request-id"] = requestId;
+      res.setHeader("X-Request-ID", requestId);
+      next();
+    });
 
     const mcpRouter = express.Router();
-    mcpRouter.use(cors({ methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE"] }));
+    mcpRouter.use(cors(CORS_OPTIONS));
     mcpRouter.use((req, res, next) => {
       if (!this.requestIsAuthenticated(req)) {
         this.returnCannedResponse(res, {

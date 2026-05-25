@@ -1,7 +1,11 @@
 import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import * as https from "https";
 import * as http from "http";
+import { randomBytes } from "crypto";
 import forge, { pki } from "node-forge";
+import * as fs from "fs/promises";
+import * as path from "path";
+import { FileSystemAdapter } from "obsidian";
 
 import RequestHandler from "./requestHandler";
 import { LocalRestApiSettings } from "./types";
@@ -72,6 +76,14 @@ export default class LocalRestApi extends Plugin {
           type: 7, // IP
           ip: DefaultBindingHost,
         },
+        {
+          type: 7, // IP
+          ip: "127.0.0.1",
+        },
+        {
+          type: 2, // DNS
+          value: "localhost",
+        },
       ];
       if (
         this.settings.bindingHost &&
@@ -104,7 +116,7 @@ export default class LocalRestApi extends Plugin {
           keyCertSign: true,
           digitalSignature: true,
           nonRepudiation: true,
-          keyEncipherment: false,
+          keyEncipherment: true,
           dataEncipherment: false,
           critical: true,
         },
@@ -131,18 +143,37 @@ export default class LocalRestApi extends Plugin {
           altNames: subjectAltNames,
         },
       ]);
-      certificate.serialNumber = "1";
+      certificate.serialNumber = randomBytes(16).toString("hex");
       certificate.publicKey = keypair.publicKey;
       certificate.validity.notAfter = expiry;
       certificate.validity.notBefore = today;
       certificate.sign(keypair.privateKey, forge.md.sha256.create());
 
+      const privateKeyPem = pki.privateKeyToPem(keypair.privateKey);
       this.settings.crypto = {
         cert: pki.certificateToPem(certificate),
-        privateKey: pki.privateKeyToPem(keypair.privateKey),
+        privateKey: privateKeyPem,
         publicKey: pki.publicKeyToPem(keypair.publicKey),
       };
       await this.saveSettings();
+
+      // M-02: Persist key.pem with restrictive permissions so that other OS
+      // users with read access to the vault cannot exfiltrate the TLS key.
+      // The certs/ directory is created with mode 0o700 (owner-only rwx);
+      // the private key file is written with mode 0o600 (owner-only rw).
+      const adapter = this.app.vault.adapter;
+      if (adapter instanceof FileSystemAdapter) {
+        const certsDir = path.join(
+          adapter.getBasePath(),
+          ".obsidian",
+          "plugins",
+          this.manifest.id,
+          "certs"
+        );
+        await fs.mkdir(certsDir, { recursive: true, mode: 0o700 });
+        const keyPath = path.join(certsDir, "key.pem");
+        await fs.writeFile(keyPath, privateKeyPem, { mode: 0o600 });
+      }
     }
 
     this.addSettingTab(new LocalRestApiSettingTab(this.app, this));
@@ -242,6 +273,26 @@ export default class LocalRestApi extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<LocalRestApiSettings>);
+
+    // L-01: Validate authorizationHeaderName to prevent misconfiguration.
+    // A header name must be a non-empty token of printable ASCII characters
+    // with no whitespace (per RFC 7230 section 3.2).
+    const headerName = this.settings.authorizationHeaderName;
+    const headerNameIsValid =
+      typeof headerName === "string" &&
+      headerName.length > 0 &&
+      !/[\x00-\x20\x7F]/.test(headerName) &&
+      !/[^\x00-\x7F]/.test(headerName);
+
+    if (!headerNameIsValid) {
+      if (headerName !== undefined && headerName !== null && headerName !== "") {
+        console.warn(
+          "[Local REST API] authorizationHeaderName contains invalid characters. " +
+          `Falling back to "${DefaultBearerTokenHeaderName}".`
+        );
+      }
+      this.settings.authorizationHeaderName = DefaultBearerTokenHeaderName;
+    }
   }
 
   async saveSettings() {
