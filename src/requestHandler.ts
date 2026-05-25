@@ -5,7 +5,6 @@ import {
   TFile,
 } from "obsidian";
 import { posix } from "path";
-import { randomUUID } from "crypto";
 import forge from "node-forge";
 
 import express from "express";
