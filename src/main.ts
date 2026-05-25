@@ -264,6 +264,26 @@ export default class LocalRestApi extends Plugin {
 
   async loadSettings() {
     this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<LocalRestApiSettings>);
+
+    // L-01: Validate authorizationHeaderName to prevent misconfiguration.
+    // A header name must be a non-empty token of printable ASCII characters
+    // with no whitespace (per RFC 7230 section 3.2).
+    const headerName = this.settings.authorizationHeaderName;
+    const headerNameIsValid =
+      typeof headerName === "string" &&
+      headerName.length > 0 &&
+      !/[\x00-\x20\x7F]/.test(headerName) &&
+      !/[^\x00-\x7F]/.test(headerName);
+
+    if (!headerNameIsValid) {
+      if (headerName !== undefined && headerName !== null && headerName !== "") {
+        console.warn(
+          "[Local REST API] authorizationHeaderName contains invalid characters. " +
+          `Falling back to "${DefaultBearerTokenHeaderName}".`
+        );
+      }
+      this.settings.authorizationHeaderName = DefaultBearerTokenHeaderName;
+    }
   }
 
   async saveSettings() {

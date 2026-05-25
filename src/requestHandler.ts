@@ -1534,14 +1534,14 @@ export default class RequestHandler {
     // L-02: Request correlation ID middleware — runs before auth so every
     // request (including rejected ones) carries a traceable ID. Accepts a
     // client-supplied X-Request-ID only when it is a valid UUID v4 string
-    // (36-char hex+dash); otherwise generates a fresh cryptographic UUID.
-    // The resolved ID is echoed back via the X-Request-ID response header.
+    // (36-char hex+dash); otherwise generates a fresh cryptographic UUID via
+    // the Web Crypto API available in Electron/Obsidian without a Node import.
     this.api.use((req, res, next) => {
       const clientId = req.headers["x-request-id"];
       const requestId =
         typeof clientId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientId)
           ? clientId
-          : randomUUID();
+          : globalThis.crypto.randomUUID();
       req.headers["x-request-id"] = requestId;
       res.setHeader("X-Request-ID", requestId);
       next();
