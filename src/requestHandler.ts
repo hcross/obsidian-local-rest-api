@@ -28,6 +28,7 @@ import {
   FileMetadataObject,
   LocalRestApiSettings,
   PeriodicNoteInterface,
+  SearchJsonResponse,
   SearchJsonResponseItem,
 } from "./types";
 import {
@@ -1364,7 +1365,7 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const handlers: Record<string, () => Promise<SearchJsonResponseItem[]>> = {
+    const handlers: Record<string, () => Promise<SearchJsonResponse>> = {
       [ContentTypes.jsonLogic]: async () => {
         return this.operations.searchJsonLogic(req.body);
       },
@@ -1384,7 +1385,10 @@ export default class RequestHandler {
     }
 
     try {
-      const results = await handlers[contentType]();
+      const { results, truncated } = await handlers[contentType]();
+      if (truncated) {
+        res.setHeader("X-Obsidian-Search-Truncated", "true");
+      }
       res.json(results);
     } catch (e) {
       const error = e as Error;

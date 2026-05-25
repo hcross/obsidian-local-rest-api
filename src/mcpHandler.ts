@@ -509,8 +509,8 @@ export class McpHandler {
           .describe("JsonLogic query object to evaluate against each note"),
       },
       async ({ query }: { query: unknown }) => {
-        const results = await this.ops.searchJsonLogic(query);
-        return this.text(results);
+        const { results, truncated } = await this.ops.searchJsonLogic(query);
+        return this.text({ results, truncated });
       },
     );
 
