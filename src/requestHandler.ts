@@ -54,6 +54,7 @@ import {
   VaultOperations,
 } from "./vaultOperations";
 import { McpHandler } from "./mcpHandler";
+import { AuditLogger } from "./auditLogger";
 
 // Import openapi.yaml as a string
 import openapiYaml from "../docs/openapi.yaml";
@@ -70,6 +71,7 @@ export default class RequestHandler {
 
   operations: VaultOperations;
   mcpHandler: McpHandler;
+  auditLogger: AuditLogger;
 
   constructor(
     app: App,
@@ -85,6 +87,8 @@ export default class RequestHandler {
     this.publicApiExtensionRouter = express.Router();
     this.operations = new VaultOperations(this.app);
     this.mcpHandler = new McpHandler(this.operations, this.settings);
+    const vaultPath = (this.app.vault.adapter as { basePath?: string }).basePath ?? "";
+    this.auditLogger = new AuditLogger(vaultPath);
 
     this.api.set("json spaces", 2);
   }
@@ -1431,6 +1435,32 @@ export default class RequestHandler {
       }
       next();
     });
+    // --- Structured audit logging middleware (M-04) ---
+    this.api.use((req, res, next) => {
+      const startMs = Date.now();
+      const requestId = (req.headers['x-request-id'] as string | undefined)
+        ?? (Math.random().toString(36).substring(2, 10) + Date.now().toString(36));
+      req.headers['x-request-id'] = requestId;
+      res.setHeader('X-Request-ID', requestId);
+
+      const authHeader = req.get(this.settings.authorizationHeaderName ?? 'Authorization') ?? '';
+      const bearerMatch = /^Bearer (.+)$/i.exec(authHeader);
+      const tokenHash = bearerMatch ? this.auditLogger.hashToken(bearerMatch[1]) : '';
+
+      res.on('finish', () => {
+        void this.auditLogger.log({
+          ts: new Date().toISOString(),
+          requestId,
+          method: req.method,
+          path: req.path,
+          status: res.statusCode,
+          tokenHash,
+          durationMs: Date.now() - startMs,
+        });
+      });
+      next();
+    });
+    // --------------------------------------------------
     this.api.use(responseTime());
     const CORS_OPTIONS: cors.CorsOptions = {
       origin: ['app://obsidian.md', 'capacitor://localhost', 'http://localhost'],
