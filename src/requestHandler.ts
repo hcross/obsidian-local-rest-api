@@ -61,6 +61,36 @@ import { sanitizeError } from "./errorUtils";
 // Import openapi.yaml as a string
 import openapiYaml from "../docs/openapi.yaml";
 
+// --- In-memory rate limiting for authentication failures (H-04) ---
+interface FailureRecord { count: number; lockedUntil?: number; }
+const authFailures = new Map<string, FailureRecord>();
+const MAX_FAILURES = 5;
+const COOLDOWN_MS = 30_000;
+
+function checkRateLimit(ip: string): void {
+  const now = Date.now();
+  const record = authFailures.get(ip) ?? { count: 0 };
+  if (record.lockedUntil && now < record.lockedUntil) {
+    const retryAfter = Math.ceil((record.lockedUntil - now) / 1000);
+    throw Object.assign(new Error("Too many failed attempts"), { statusCode: 429, retryAfter });
+  }
+}
+
+function recordAuthFailure(ip: string): void {
+  const record = authFailures.get(ip) ?? { count: 0 };
+  record.count += 1;
+  if (record.count >= MAX_FAILURES) {
+    record.lockedUntil = Date.now() + COOLDOWN_MS;
+    record.count = 0;
+  }
+  authFailures.set(ip, record);
+}
+
+function recordAuthSuccess(ip: string): void {
+  authFailures.delete(ip);
+}
+// ------------------------------------------------------------------
+
 export default class RequestHandler {
   app: App;
   api: express.Express;
@@ -144,14 +174,34 @@ export default class RequestHandler {
       "/openapi.yaml",
     ];
 
-    if (
-      !authenticationExemptRoutes.includes(req.path) &&
-      !this.requestIsAuthenticated(req)
-    ) {
-      this.returnCannedResponse(res, {
-        errorCode: ErrorCode.ApiKeyAuthorizationRequired,
-      });
-      return;
+    if (!authenticationExemptRoutes.includes(req.path)) {
+      const ip = req.ip ?? req.socket.remoteAddress ?? "unknown";
+
+      // Check rate limit before evaluating the token
+      try {
+        checkRateLimit(ip);
+      } catch (err) {
+        const e = err as { statusCode?: number; retryAfter?: number };
+        if (e.statusCode === 429) {
+          res.set("Retry-After", String(e.retryAfter ?? 30));
+          this.returnCannedResponse(res, {
+            statusCode: 429,
+            message: (err as Error).message,
+          });
+          return;
+        }
+        throw err;
+      }
+
+      if (!this.requestIsAuthenticated(req)) {
+        recordAuthFailure(ip);
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.ApiKeyAuthorizationRequired,
+        });
+        return;
+      }
+
+      recordAuthSuccess(ip);
     }
 
     next();
