@@ -72,4 +72,6 @@ export const DefaultBindingHost = "127.0.0.1";
 export const LicenseUrl =
   "https://raw.githubusercontent.com/coddingtonbear/obsidian-local-rest-api/main/LICENSE";
 
-export const MaximumRequestSize = "1024mb";
+// Default is 10 MB. Override via OBSIDIAN_MAX_REQUEST_SIZE env var (express size format, e.g. "50mb").
+export const MaximumRequestSize =
+  process.env.OBSIDIAN_MAX_REQUEST_SIZE ?? "10mb";
