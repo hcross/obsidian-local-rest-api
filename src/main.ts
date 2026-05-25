@@ -1,6 +1,7 @@
 import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import * as https from "https";
 import * as http from "http";
+import { randomBytes } from "crypto";
 import forge, { pki } from "node-forge";
 
 import RequestHandler from "./requestHandler";
@@ -72,6 +73,14 @@ export default class LocalRestApi extends Plugin {
           type: 7, // IP
           ip: DefaultBindingHost,
         },
+        {
+          type: 7, // IP
+          ip: "127.0.0.1",
+        },
+        {
+          type: 2, // DNS
+          value: "localhost",
+        },
       ];
       if (
         this.settings.bindingHost &&
@@ -104,7 +113,7 @@ export default class LocalRestApi extends Plugin {
           keyCertSign: true,
           digitalSignature: true,
           nonRepudiation: true,
-          keyEncipherment: false,
+          keyEncipherment: true,
           dataEncipherment: false,
           critical: true,
         },
@@ -131,7 +140,7 @@ export default class LocalRestApi extends Plugin {
           altNames: subjectAltNames,
         },
       ]);
-      certificate.serialNumber = "1";
+      certificate.serialNumber = randomBytes(16).toString("hex");
       certificate.publicKey = keypair.publicKey;
       certificate.validity.notAfter = expiry;
       certificate.validity.notBefore = today;
