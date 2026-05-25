@@ -5,6 +5,7 @@ import {
   TFile,
 } from "obsidian";
 import { posix } from "path";
+import { randomUUID } from "crypto";
 import forge from "node-forge";
 
 import express from "express";
@@ -55,6 +56,7 @@ import {
 } from "./vaultOperations";
 import { McpHandler } from "./mcpHandler";
 import { AuditLogger } from "./auditLogger";
+import { sanitizeError } from "./errorUtils";
 
 // Import openapi.yaml as a string
 import openapiYaml from "../docs/openapi.yaml";
@@ -596,7 +598,7 @@ export default class RequestHandler {
       } else if (e instanceof PatchFailed) {
         this.returnCannedResponse(res, { errorCode: ErrorCode.PatchFailed, message: e.reason });
       } else {
-        this.returnCannedResponse(res, { statusCode: 500, message: (e as Error).message });
+        this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file") });
       }
     }
   }
@@ -657,7 +659,7 @@ export default class RequestHandler {
       } else if (e instanceof PatchFailed) {
         this.returnCannedResponse(res, { errorCode: ErrorCode.PatchFailed, message: (e).reason });
       } else {
-        this.returnCannedResponse(res, { statusCode: 500, message: (e as Error).message });
+        this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file section") });
       }
     }
   }
@@ -843,10 +845,9 @@ export default class RequestHandler {
           errorCode: ErrorCode.DestinationAlreadyExists,
         });
       } else {
-        const msg = error instanceof Error ? error.message : String(error);
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.FileOperationFailed,
-          message: `Failed to move file: ${msg}`,
+          message: sanitizeError(error, "move file"),
         });
       }
     }
@@ -1264,7 +1265,7 @@ export default class RequestHandler {
       } else {
         this.returnCannedResponse(res, {
           statusCode: 500,
-          message: err instanceof Error ? err.message : String(err),
+          message: sanitizeError(err, "execute command"),
         });
       }
       return;
@@ -1293,7 +1294,7 @@ export default class RequestHandler {
     } catch (e) {
       console.error("Could not prepare simple search: ", e);
       return this.returnCannedResponse(res, {
-        message: `${e}`,
+        message: sanitizeError(e, "simple search"),
         errorCode: ErrorCode.ErrorPreparingSimpleSearch,
       });
     }
@@ -1340,7 +1341,7 @@ export default class RequestHandler {
       const error = e as Error;
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.InvalidFilterQuery,
-        message: `${error.message}`,
+        message: sanitizeError(error, "search query"),
       });
       return;
     }
@@ -1411,7 +1412,7 @@ export default class RequestHandler {
     }
     this.returnCannedResponse(res, {
       statusCode: 500,
-      message: err.message,
+      message: sanitizeError(err, "internal server error"),
     });
     return;
   }
@@ -1477,6 +1478,22 @@ export default class RequestHandler {
       if (req.secure) {
         res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
       }
+      next();
+    });
+
+    // L-02: Request correlation ID middleware — runs before auth so every
+    // request (including rejected ones) carries a traceable ID. Accepts a
+    // client-supplied X-Request-ID only when it is a valid UUID v4 string
+    // (36-char hex+dash); otherwise generates a fresh cryptographic UUID.
+    // The resolved ID is echoed back via the X-Request-ID response header.
+    this.api.use((req, res, next) => {
+      const clientId = req.headers["x-request-id"];
+      const requestId =
+        typeof clientId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientId)
+          ? clientId
+          : randomUUID();
+      req.headers["x-request-id"] = requestId;
+      res.setHeader("X-Request-ID", requestId);
       next();
     });
 
