@@ -22,3 +22,6 @@ dist/*
 
 # Vim swap files
 *.swp
+
+# TLS certificates — must not be committed or synced via cloud vaults
+certs/
