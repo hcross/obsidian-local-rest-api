@@ -26,6 +26,17 @@ const safeRegex = require("safe-regex2") as (
   re: string | RegExp,
 ) => boolean;
 
+// DoS protection: hard caps on vault search scope and duration.
+// Both can be overridden via environment variables.
+export const SEARCH_LIMIT = parseInt(
+  process.env.OBSIDIAN_SEARCH_LIMIT ?? "500",
+  10,
+);
+export const QUERY_TIMEOUT_MS = parseInt(
+  process.env.OBSIDIAN_QUERY_TIMEOUT_MS ?? "10000",
+  10,
+);
+
 export class FileNotFoundError extends Error {}
 export class CommandNotFoundError extends Error {}
 export class DestinationAlreadyExistsError extends Error {}
@@ -36,6 +47,7 @@ import {
   FileMetadataObject,
   PeriodicNoteInterface,
   SearchContext,
+  SearchJsonResponse,
   SearchJsonResponseItem,
   SearchResponseItem,
 } from "./types";
@@ -564,15 +576,31 @@ export class VaultOperations {
     return results;
   }
 
-  async searchJsonLogic(
-    query: unknown,
-  ): Promise<SearchJsonResponseItem[]> {
+  async searchJsonLogic(query: unknown): Promise<SearchJsonResponse> {
     const results: SearchJsonResponseItem[] = [];
     const backlinksIndex = this.buildBacklinksIndex();
     const includeContent = JSON.stringify(query).includes('"content"');
 
-    for (const file of this.app.vault.getMarkdownFiles()) {
-      const fileContext = await this.getFileMetadataObject(file, backlinksIndex, includeContent);
+    const files = this.app.vault.getMarkdownFiles();
+    const deadline = Date.now() + QUERY_TIMEOUT_MS;
+    let truncated = false;
+
+    for (let i = 0; i < files.length; i++) {
+      if (i >= SEARCH_LIMIT) {
+        truncated = true;
+        break;
+      }
+      if (Date.now() > deadline) {
+        truncated = true;
+        break;
+      }
+
+      const file = files[i];
+      const fileContext = await this.getFileMetadataObject(
+        file,
+        backlinksIndex,
+        includeContent,
+      );
 
       try {
         const fileResult = jsonLogic.apply(query, fileContext);
@@ -586,7 +614,7 @@ export class VaultOperations {
       }
     }
 
-    return results;
+    return { results, truncated };
   }
 
   private isTruthy(value: unknown): boolean {
