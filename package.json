@@ -57,6 +57,7 @@
     "obsidian-dataview": "^0.5.47",
     "query-string": "^7.1.1",
     "response-time": "^2.3.2",
+    "safe-regex2": "^5.1.1",
     "uuid": "^8.3.2"
   }
 }
