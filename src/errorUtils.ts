@@ -42,7 +42,7 @@ export function sanitizeError(error: unknown, operation: string): string {
   // Strip absolute paths from the message before returning.
   const raw = err.message ?? String(error);
   const sanitized = raw.replace(
-    /\/(?:Users|home|root|var|tmp|opt|usr)[^\s,'"]+/g,
+    /\/[^\s,'"]{2,}/g,
     "<path>",
   );
   return `${operation}: ${sanitized}`;

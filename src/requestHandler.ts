@@ -5,6 +5,7 @@ import {
   TFile,
 } from "obsidian";
 import { posix } from "path";
+import { randomUUID } from "crypto";
 import forge from "node-forge";
 
 import express from "express";
@@ -1488,7 +1489,7 @@ export default class RequestHandler {
     this.api.use((req, res, next) => {
       const clientId = req.headers["x-request-id"];
       const requestId =
-        typeof clientId === "string" && /^[0-9a-f-]{36}$/i.test(clientId)
+        typeof clientId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(clientId)
           ? clientId
           : randomUUID();
       req.headers["x-request-id"] = requestId;
