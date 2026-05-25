@@ -2,6 +2,9 @@ import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import * as https from "https";
 import * as http from "http";
 import forge, { pki } from "node-forge";
+import * as fs from "fs/promises";
+import * as path from "path";
+import { FileSystemAdapter } from "obsidian";
 
 import RequestHandler from "./requestHandler";
 import { LocalRestApiSettings } from "./types";
@@ -137,12 +140,31 @@ export default class LocalRestApi extends Plugin {
       certificate.validity.notBefore = today;
       certificate.sign(keypair.privateKey, forge.md.sha256.create());
 
+      const privateKeyPem = pki.privateKeyToPem(keypair.privateKey);
       this.settings.crypto = {
         cert: pki.certificateToPem(certificate),
-        privateKey: pki.privateKeyToPem(keypair.privateKey),
+        privateKey: privateKeyPem,
         publicKey: pki.publicKeyToPem(keypair.publicKey),
       };
       await this.saveSettings();
+
+      // M-02: Persist key.pem with restrictive permissions so that other OS
+      // users with read access to the vault cannot exfiltrate the TLS key.
+      // The certs/ directory is created with mode 0o700 (owner-only rwx);
+      // the private key file is written with mode 0o600 (owner-only rw).
+      const adapter = this.app.vault.adapter;
+      if (adapter instanceof FileSystemAdapter) {
+        const certsDir = path.join(
+          adapter.getBasePath(),
+          ".obsidian",
+          "plugins",
+          this.manifest.id,
+          "certs"
+        );
+        await fs.mkdir(certsDir, { recursive: true, mode: 0o700 });
+        const keyPath = path.join(certsDir, "key.pem");
+        await fs.writeFile(keyPath, privateKeyPem, { mode: 0o600 });
+      }
     }
 
     this.addSettingTab(new LocalRestApiSettingTab(this.app, this));
