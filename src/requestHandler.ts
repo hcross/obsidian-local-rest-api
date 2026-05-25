@@ -1432,10 +1432,26 @@ export default class RequestHandler {
       next();
     });
     this.api.use(responseTime());
-    this.api.use(cors({ methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE"] }));
+    const CORS_OPTIONS: cors.CorsOptions = {
+      origin: ['app://obsidian.md', 'capacitor://localhost', 'http://localhost'],
+      methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE"],
+    };
+
+    this.api.use(cors(CORS_OPTIONS));
+
+    this.api.use((req, res, next) => {
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      res.setHeader('Content-Security-Policy', "default-src 'none'");
+      if (req.secure) {
+        res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+      }
+      next();
+    });
 
     const mcpRouter = express.Router();
-    mcpRouter.use(cors({ methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE"] }));
+    mcpRouter.use(cors(CORS_OPTIONS));
     mcpRouter.use((req, res, next) => {
       if (!this.requestIsAuthenticated(req)) {
         this.returnCannedResponse(res, {
