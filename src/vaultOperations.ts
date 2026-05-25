@@ -22,6 +22,9 @@ const jsonLogic = require("json-logic-js") as {
 };
  
 const WildcardRegexp = require("glob-to-regexp") as (pattern: string) => RegExp;
+const safeRegex = require("safe-regex2") as (
+  re: string | RegExp,
+) => boolean;
 
 export class FileNotFoundError extends Error {}
 export class CommandNotFoundError extends Error {}
@@ -53,6 +56,14 @@ export class VaultOperations {
       "regexp",
       (pattern: string | undefined, field: string | undefined) => {
         if (typeof field === "string" && typeof pattern === "string") {
+          if (pattern.length > 500) {
+            throw new Error("regexp: pattern exceeds maximum allowed length");
+          }
+          if (!safeRegex(pattern)) {
+            throw new Error(
+              "regexp: potentially unsafe regular expression rejected (ReDoS protection)",
+            );
+          }
           return new RegExp(pattern).test(field);
         }
         return false;
