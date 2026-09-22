@@ -165,7 +165,7 @@ export default class LocalRestApi extends Plugin {
       if (adapter instanceof FileSystemAdapter) {
         const certsDir = path.join(
           adapter.getBasePath(),
-          ".obsidian",
+          this.app.vault.configDir,
           "plugins",
           this.manifest.id,
           "certs"
@@ -281,8 +281,7 @@ export default class LocalRestApi extends Plugin {
     const headerNameIsValid =
       typeof headerName === "string" &&
       headerName.length > 0 &&
-      !/[\x00-\x20\x7F]/.test(headerName) &&
-      !/[^\x00-\x7F]/.test(headerName);
+      /^[!-~]+$/.test(headerName);
 
     if (!headerNameIsValid) {
       if (headerName !== undefined && headerName !== null && headerName !== "") {

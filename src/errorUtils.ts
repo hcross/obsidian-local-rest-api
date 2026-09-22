@@ -28,6 +28,18 @@ const KNOWN_CODES: Record<string, string> = {
  * @param operation  A short description of the failing operation, used as a
  *                   prefix in the returned string (e.g. "patch file").
  */
+/**
+ * Extract a human-readable message from a caught value, without falling back
+ * to the default object stringification (`String(value)` on unknown values).
+ */
+function getErrorMessage(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  const message = (value as { message?: unknown })?.message;
+  return typeof message === "string" ? message : "unknown error";
+}
+
 export function sanitizeError(error: unknown, operation: string): string {
   const err = error as { code?: string; message?: string };
 
@@ -36,12 +48,11 @@ export function sanitizeError(error: unknown, operation: string): string {
   }
 
   if (process.env.OBSIDIAN_DEBUG === "true") {
-    return `${operation}: ${err.message ?? String(error)}`;
+    return `${operation}: ${getErrorMessage(error)}`;
   }
 
   // Strip absolute paths from the message before returning.
-  const raw = err.message ?? String(error);
-  const sanitized = raw.replace(
+  const sanitized = getErrorMessage(error).replace(
     /\/[^\s,'"]{2,}/g,
     "<path>",
   );
