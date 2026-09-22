@@ -577,21 +577,41 @@ describe("McpHandler", () => {
 
   // ---- command_execute ----------------------------------------------------
 
-  test("command_execute calls executeCommand and returns OK", async () => {
-    const cb = getToolCallback("command_execute");
-    const result = await cb({ commandId: "cmd-id" });
-    expect(ops.executeCommand).toHaveBeenCalledWith("cmd-id");
-    expect(parseText(result).message).toBe("OK");
-  });
+  describe("command_execute", () => {
+    const previousAllowlistEnv = process.env.OBSIDIAN_ALLOWED_COMMANDS;
 
-  test("command_execute propagates error when command not found", async () => {
-    ops.executeCommand.mockImplementation(() => {
-      throw new Error("Command not found: bad-id");
+    beforeEach(() => {
+      process.env.OBSIDIAN_ALLOWED_COMMANDS = "cmd-id";
     });
-    const cb = getToolCallback("command_execute");
-    await expect(cb({ commandId: "bad-id" })).rejects.toThrow(
-      "Command not found",
-    );
+
+    afterEach(() => {
+      process.env.OBSIDIAN_ALLOWED_COMMANDS = previousAllowlistEnv;
+    });
+
+    test("command_execute calls executeCommand and returns OK", async () => {
+      const cb = getToolCallback("command_execute");
+      const result = await cb({ commandId: "cmd-id" });
+      expect(ops.executeCommand).toHaveBeenCalledWith("cmd-id");
+      expect(parseText(result).message).toBe("OK");
+    });
+
+    test("command_execute propagates error when command not found", async () => {
+      ops.executeCommand.mockImplementation(() => {
+        throw new Error("Command not found: cmd-id");
+      });
+      const cb = getToolCallback("command_execute");
+      await expect(cb({ commandId: "cmd-id" })).rejects.toThrow(
+        "Command not found",
+      );
+    });
+
+    test("command_execute rejects when the allowlist is unset (fail-secure)", async () => {
+      delete process.env.OBSIDIAN_ALLOWED_COMMANDS;
+      const cb = getToolCallback("command_execute");
+      await expect(cb({ commandId: "cmd-id" })).rejects.toThrow(
+        "command_execute is disabled",
+      );
+    });
   });
 
   // ---- open_file ----------------------------------------------------------

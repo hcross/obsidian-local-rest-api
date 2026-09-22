@@ -19,12 +19,14 @@ const PERIODS = ["daily", "weekly", "monthly", "quarterly", "yearly"] as const;
 // Populated from the OBSIDIAN_ALLOWED_COMMANDS environment variable (comma-separated list).
 // If the variable is absent or empty, the set remains empty and ALL commands are blocked
 // (fail-secure default).
-const ALLOWED_COMMANDS = new Set(
-  (process.env.OBSIDIAN_ALLOWED_COMMANDS ?? "")
-    .split(",")
-    .map((c) => c.trim())
-    .filter(Boolean)
-);
+function getCommandAllowlist(): Set<string> {
+  return new Set(
+    (process.env.OBSIDIAN_ALLOWED_COMMANDS ?? "")
+      .split(",")
+      .map((c) => c.trim())
+      .filter(Boolean)
+  );
+}
 
 // Minimal structural type for McpServer — typed as a plain interface rather than the SDK's
 // McpServer class to avoid TypeScript heap OOM from evaluating ToolCallback<ZodRawShape>.
@@ -568,12 +570,13 @@ export class McpHandler {
         "Throws if the command ID does not exist or is not in the allowlist.",
       { commandId: z.string().describe("The command ID to execute (e.g. 'editor:toggle-bold')") },
       async ({ commandId }: { commandId: string }) => {
-        if (ALLOWED_COMMANDS.size === 0) {
+        const allowedCommands = getCommandAllowlist();
+        if (allowedCommands.size === 0) {
           throw new Error(
             `command_execute is disabled. Set OBSIDIAN_ALLOWED_COMMANDS to a comma-separated list of allowed command IDs.`
           );
         }
-        if (!ALLOWED_COMMANDS.has(commandId)) {
+        if (!allowedCommands.has(commandId)) {
           throw new Error(
             `Command "${commandId}" is not in the allowed list. Set OBSIDIAN_ALLOWED_COMMANDS to enable it.`
           );
