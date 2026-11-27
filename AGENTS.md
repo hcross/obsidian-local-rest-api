@@ -34,6 +34,10 @@ variable, because each needs something of the person running them:
 - `OBSIDIAN_TEST_OPEN_FILE=1` — enables the `open_file` test. It is off by default
   because opening a file pulls Obsidian to the foreground and takes keyboard focus
   mid-run, so keystrokes meant for another window can land in the opened note.
+- `OBSIDIAN_TEST_COMMAND_EXECUTE=1` — enables the MCP `command_execute` test. The tool only
+  runs IDs listed in `OBSIDIAN_ALLOWED_COMMANDS` in *Obsidian's own* environment, which the
+  test runner cannot see, so launch Obsidian with `OBSIDIAN_ALLOWED_COMMANDS=editor:save-file`
+  first.
 - `OBSIDIAN_VAULT_PATH=<absolute path to the vault>` — enables the configuration-directory
   symlink test, which plants a symlink to `.obsidian` under the integration fixture
   directory (and removes it afterwards) to check the guard follows a path to where it

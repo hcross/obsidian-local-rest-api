@@ -185,10 +185,9 @@ export function encodeVaultPath(path: string): string {
  *
  * - Per the Fetch standard the wildcard is only special for requests made *without*
  *   credentials; in a credentialed request it is read as the literal header name `*`.
- *   This API sends `Access-Control-Allow-Origin: *` and never
- *   `Access-Control-Allow-Credentials`, so a credentialed request already cannot
- *   succeed here. Should the origin policy ever gain credentials, this must become an
- *   explicit list at the same time.
+ *   This API never sends `Access-Control-Allow-Credentials`, so a credentialed request
+ *   cannot succeed here. Should the origin policy ever gain credentials, this must
+ *   become an explicit list at the same time.
  * - Safari only honoured the wildcard from 15.4 (March 2022). Older clients fall back
  *   to the safelist -- no worse off than before this was set.
  *
@@ -1868,7 +1867,7 @@ export default class RequestHandler {
         // the 1.x endpoint rather than reporting a server fault.
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.PatchFailed,
-          message: (e as Error).message,
+          message: sanitizeError(e, "patch file"),
         });
       }
     }
@@ -1967,7 +1966,7 @@ export default class RequestHandler {
         } else if (e instanceof FrontmatterParseError) {
           this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidFrontmatter, message: e.message });
         } else {
-          this.returnCannedResponse(res, { statusCode: 500, message: (e as Error).message });
+          this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file section") });
         }
       }
       return;
@@ -2388,10 +2387,9 @@ export default class RequestHandler {
           errorCode: ErrorCode.ConfigDirAccessNotAllowed,
         });
       } else {
-        const msg = error instanceof Error ? error.message : String(error);
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.FileOperationFailed,
-          message: `Failed to copy file: ${msg}`,
+          message: sanitizeError(error, "copy file"),
         });
       }
     }

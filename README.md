@@ -234,7 +234,9 @@ The `ETag` sent with a note's HTML rendering or its note JSON is not this token,
 
 Several endpoints answer in a response header rather than in the body: `ETag` carries a file's version for [conditional writes](#conditional-writes), `Content-Location` tells you which file a targeted or `/active/` request actually resolved to, `Markdown-Patch-Warnings` reports what a `PATCH` had to work around, `Deprecation` warns that a format is sunsetting, and `Mcp-Session-Id` carries the session for a sessionful MCP connection.
 
-Browsers hide response headers from JavaScript unless the server opts them in, so the API sends `Access-Control-Expose-Headers: *` and all of them are readable with `response.headers.get(...)`. Safari honours the wildcard from 15.4 onward; older browsers see only the [CORS-safelisted headers](https://developer.mozilla.org/en-US/docs/Glossary/CORS-safelisted_response_header). Requests made with `credentials: "include"` are not supported — the API authenticates with a bearer token and sends `Access-Control-Allow-Origin: *`, which browsers reject for credentialed requests.
+Browsers hide response headers from JavaScript unless the server opts them in, so the API sends `Access-Control-Expose-Headers: *` and all of them are readable with `response.headers.get(...)`. Safari honours the wildcard from 15.4 onward; older browsers see only the [CORS-safelisted headers](https://developer.mozilla.org/en-US/docs/Glossary/CORS-safelisted_response_header). Requests made with `credentials: "include"` are not supported — the API authenticates with a bearer token and never sends `Access-Control-Allow-Credentials`.
+
+Cross-origin access is limited to an allowlist of origins: `app://obsidian.md`, `capacitor://localhost` and `http://localhost` (no other port). A browser page served from any other origin gets no `Access-Control-Allow-Origin` header, so it cannot read responses.
 
 ## Patching notes
 

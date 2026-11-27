@@ -2307,7 +2307,11 @@ describe("McpHandler", () => {
     });
 
     afterEach(() => {
-      process.env.OBSIDIAN_ALLOWED_COMMANDS = previousAllowlistEnv;
+      if (previousAllowlistEnv === undefined) {
+        delete process.env.OBSIDIAN_ALLOWED_COMMANDS;
+      } else {
+        process.env.OBSIDIAN_ALLOWED_COMMANDS = previousAllowlistEnv;
+      }
     });
 
     test("command_execute calls executeCommand and returns OK", async () => {

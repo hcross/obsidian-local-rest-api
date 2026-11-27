@@ -1313,9 +1313,10 @@ describe("search_query tool", () => {
       name: "search_query",
       arguments: { query: { in: [TAG_FIXTURE, { var: "tags" }] } },
     });
-    const body = jsonOf<any[]>(result);
-    expect(Array.isArray(body)).toBe(true);
-    expect(body.some((item) => item.filename === TEST_PATH)).toBe(true);
+    const { results, truncated } = jsonOf<{ results: any[]; truncated: boolean }>(result);
+    expect(Array.isArray(results)).toBe(true);
+    expect(typeof truncated).toBe("boolean");
+    expect(results.some((item) => item.filename === TEST_PATH)).toBe(true);
   });
 
   test("frontmatter numeric comparison finds fixture", async () => {
@@ -1325,8 +1326,8 @@ describe("search_query tool", () => {
         query: { "==": [{ var: "frontmatter.priority" }, FM_PRIORITY_VALUE] },
       },
     });
-    const body = jsonOf<any[]>(result);
-    expect(body.some((item) => item.filename === TEST_PATH)).toBe(true);
+    const { results } = jsonOf<{ results: any[] }>(result);
+    expect(results.some((item) => item.filename === TEST_PATH)).toBe(true);
   });
 });
 
@@ -1369,8 +1370,14 @@ describe("command_list tool", () => {
   });
 });
 
+// command_execute only runs IDs in the OBSIDIAN_ALLOWED_COMMANDS environment variable of the
+// *Obsidian* process (not of this test runner), which the test cannot see. It is therefore
+// opt-in: launch Obsidian with OBSIDIAN_ALLOWED_COMMANDS=editor:save-file and run the tests
+// with OBSIDIAN_TEST_COMMAND_EXECUTE=1.
+const commandExecuteTest = process.env.OBSIDIAN_TEST_COMMAND_EXECUTE ? test : test.skip;
+
 describe("command_execute tool", () => {
-  test("executes editor:save-file and returns OK", async () => {
+  commandExecuteTest("executes editor:save-file and returns OK", async () => {
     const listResult = await client.callTool({ name: "command_list", arguments: {} });
     const { commands } = jsonOf<{ commands: { id: string }[] }>(listResult);
     if (!commands.find((c) => c.id === "editor:save-file")) {

@@ -150,8 +150,17 @@ export default class LocalRestApi extends Plugin {
       this.manifest.id,
       "certs"
     );
-    await fs.mkdir(certsDir, { recursive: true, mode: 0o700 });
-    await fs.writeFile(path.join(certsDir, "key.pem"), privateKey, { mode: 0o600 });
+    try {
+      await fs.mkdir(certsDir, { recursive: true, mode: 0o700 });
+      const keyPath = path.join(certsDir, "key.pem");
+      await fs.writeFile(keyPath, privateKey, { mode: 0o600 });
+      // `mode` only applies when the file is created; tighten one that already exists.
+      await fs.chmod(keyPath, 0o600);
+    } catch (e) {
+      // A failure here must not stop the plugin from loading: the server and the
+      // settings tab still work, the key just is not mirrored to disk.
+      console.error("[REST API] Could not persist certs/key.pem", e);
+    }
   }
 
   getPublicApi(pluginManifest: PluginManifest): LocalRestApiPublicApi {
