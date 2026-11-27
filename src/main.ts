@@ -1,14 +1,24 @@
-import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
+import {
+  App,
+  ConfirmationModal,
+  ExtraButtonComponent,
+  FileSystemAdapter,
+  Notice,
+  Plugin,
+  PluginSettingTab,
+  Setting,
+  SettingDefinitionItem,
+} from "obsidian";
 import * as https from "https";
 import * as http from "http";
-import { randomBytes } from "crypto";
-import forge, { pki } from "node-forge";
+import forge from "node-forge";
 import * as fs from "fs/promises";
 import * as path from "path";
-import { FileSystemAdapter } from "obsidian";
 
 import RequestHandler from "./requestHandler";
 import { LocalRestApiSettings } from "./types";
+import { t, tPlural } from "./i18n";
+import { renderTemplate } from "./i18nTemplate";
 
 import {
   DefaultBearerTokenHeaderName,
@@ -18,28 +28,62 @@ import {
   LicenseUrl,
 } from "./constants";
 import {
-  getCertificateIsUptoStandards,
-  getCertificateValidityDays,
-} from "./utils";
-import LocalRestApiPublicApi, { ApiVersionUnsupportedError } from "./api";
-export { ApiVersionUnsupportedError } from "./api";
+  CertificateStandardsIssue,
+  buildServerCertificateChain,
+  generateCryptoSettings,
+  getCertificateStandardsIssue,
+  getReportedValidityDays,
+  renewServerCertificateIfNeeded,
+} from "./certificates";
+import type { LocalRestApiPublicApi } from "./publicApi";
+import {
+  DefaultSignedUrlTtlSeconds,
+  MaximumSignedUrlTtlSeconds,
+  MinimumSignedUrlTtlSeconds,
+  clampSignedUrlTtl,
+} from "./signedUrls";
+import {
+  DefaultStateReadTimeoutMs,
+  MaximumStateReadTimeoutMs,
+  MinimumStateReadTimeoutMs,
+  clampStateReadTimeout,
+} from "./serverState";
+// The extension API is defined in ./publicApi, which is what the generated
+// publicApi.d.ts ships to extension authors. Re-exported here so that anything
+// importing the plugin entry point keeps seeing the same names it always has.
+export {
+  ApiVersionUnsupportedError,
+  getAPI,
+  type McpToolAnnotations,
+  type LocalRestApiPublicApi,
+} from "./publicApi";
 import { PluginManifest } from "obsidian";
 import { configureHttpServerTimeouts } from "./serverTimeouts";
+import { closeServer, describeServerError, listenServer } from "./serverBinding";
+
+type ServerProtocol = "HTTP" | "HTTPS";
+type ServerStatus =
+  | { state: "off" | "starting" | "listening" }
+  | { state: "failed"; reason: string };
 
 export default class LocalRestApi extends Plugin {
-  settings: LocalRestApiSettings;
+  declare settings: LocalRestApiSettings;
   secureServer: https.Server | null = null;
   insecureServer: http.Server | null = null;
+  private serverRefresh: Promise<void> = Promise.resolve();
+  private refreshTimer: number | undefined;
+  private refreshGeneration = 0;
+  private unloaded = false;
+  private serverStatus: Record<ServerProtocol, ServerStatus> = {
+    HTTP: { state: "off" },
+    HTTPS: { state: "off" },
+  };
+  private readonly serverStatusListeners = new Set<() => void>();
   requestHandler: RequestHandler;
-  refreshServerState: () => void;
 
   async onload() {
-    this.refreshServerState = this.debounce(
-      this._refreshServerState.bind(this),
-      1000
-    );
-
     await this.loadSettings();
+
     this.requestHandler = new RequestHandler(
       this.app,
       this.manifest,
@@ -56,131 +100,58 @@ export default class LocalRestApi extends Plugin {
       await this.saveSettings();
     }
     if (!this.settings.crypto) {
-      const expiry = new Date();
-      const today = new Date();
-      expiry.setDate(today.getDate() + 365);
-
-      const keypair = forge.pki.rsa.generateKeyPair(2048);
-      const attrs = [
-        {
-          name: "commonName",
-          value: "Obsidian Local REST API",
-        },
-      ];
-      const certificate = forge.pki.createCertificate();
-      certificate.setIssuer(attrs);
-      certificate.setSubject(attrs);
-
-      const subjectAltNames: Record<string, unknown>[] = [
-        {
-          type: 7, // IP
-          ip: DefaultBindingHost,
-        },
-        {
-          type: 7, // IP
-          ip: "127.0.0.1",
-        },
-        {
-          type: 2, // DNS
-          value: "localhost",
-        },
-      ];
-      if (
-        this.settings.bindingHost &&
-        this.settings.bindingHost !== "0.0.0.0"
-      ) {
-        subjectAltNames.push({
-          type: 7, // IP
-          ip: this.settings.bindingHost,
-        });
-      }
-      if (this.settings.subjectAltNames) {
-        for (const name of this.settings.subjectAltNames.split("\n")) {
-          if (name.trim()) {
-            subjectAltNames.push({
-              type: 2,
-              value: name.trim(),
-            });
-          }
-        }
-      }
-
-      certificate.setExtensions([
-        {
-          name: "basicConstraints",
-          cA: true,
-          critical: true,
-        },
-        {
-          name: "keyUsage",
-          keyCertSign: true,
-          digitalSignature: true,
-          nonRepudiation: true,
-          keyEncipherment: true,
-          dataEncipherment: false,
-          critical: true,
-        },
-        {
-          name: "extKeyUsage",
-          serverAuth: true,
-          clientAuth: true,
-          codeSigning: true,
-          emailProtection: true,
-          timeStamping: true,
-        },
-        {
-          name: "nsCertType",
-          client: true,
-          server: true,
-          email: true,
-          objsign: true,
-          sslCA: true,
-          emailCA: true,
-          objCA: true,
-        },
-        {
-          name: "subjectAltName",
-          altNames: subjectAltNames,
-        },
-      ]);
-      certificate.serialNumber = randomBytes(16).toString("hex");
-      certificate.publicKey = keypair.publicKey;
-      certificate.validity.notAfter = expiry;
-      certificate.validity.notBefore = today;
-      certificate.sign(keypair.privateKey, forge.md.sha256.create());
-
-      const privateKeyPem = pki.privateKeyToPem(keypair.privateKey);
-      this.settings.crypto = {
-        cert: pki.certificateToPem(certificate),
-        privateKey: privateKeyPem,
-        publicKey: pki.publicKeyToPem(keypair.publicKey),
-      };
+      this.settings.crypto = generateCryptoSettings({
+        bindingHost: this.settings.bindingHost,
+        subjectAltNames: this.settings.subjectAltNames,
+      });
       await this.saveSettings();
-
-      // M-02: Persist key.pem with restrictive permissions so that other OS
-      // users with read access to the vault cannot exfiltrate the TLS key.
-      // The certs/ directory is created with mode 0o700 (owner-only rwx);
-      // the private key file is written with mode 0o600 (owner-only rw).
-      const adapter = this.app.vault.adapter;
-      if (adapter instanceof FileSystemAdapter) {
-        const certsDir = path.join(
-          adapter.getBasePath(),
-          this.app.vault.configDir,
-          "plugins",
-          this.manifest.id,
-          "certs"
-        );
-        await fs.mkdir(certsDir, { recursive: true, mode: 0o700 });
-        const keyPath = path.join(certsDir, "key.pem");
-        await fs.writeFile(keyPath, privateKeyPem, { mode: 0o600 });
+      await this.persistPrivateKey();
+    } else {
+      // Material generated with a CA can have its server certificate renewed
+      // quietly; the CA users have trusted stays the same. Legacy single
+      // self-signed certificates are left alone (see renderCertificateWarnings).
+      const renewed = renewServerCertificateIfNeeded(this.settings.crypto, {
+        bindingHost: this.settings.bindingHost,
+        subjectAltNames: this.settings.subjectAltNames,
+      });
+      if (renewed) {
+        this.settings.crypto = renewed;
+        await this.saveSettings();
+        await this.persistPrivateKey();
+        if (this.settings.enableVerboseLogging) {
+          console.debug("[REST API] Renewed the server certificate from the stored CA");
+        }
       }
     }
 
+    // Settings can unload and load this same instance. Enable refreshes only
+    // once the new request handler and settings are ready.
+    this.unloaded = false;
+    this.refreshServerState();
     this.addSettingTab(new LocalRestApiSettingTab(this.app, this));
 
-    this.refreshServerState();
-
     this.app.workspace.trigger("obsidian-local-rest-api:loaded");
+  }
+
+  // M-02: Persist key.pem with restrictive permissions so that other OS users
+  // with read access to the vault cannot exfiltrate the TLS key. The certs/
+  // directory is created with mode 0o700 (owner-only rwx); the private key file
+  // is written with mode 0o600 (owner-only rw).
+  private async persistPrivateKey(): Promise<void> {
+    const privateKey = this.settings.crypto?.privateKey;
+    const adapter = this.app.vault.adapter;
+    if (!privateKey || !(adapter instanceof FileSystemAdapter)) {
+      return;
+    }
+    const certsDir = path.join(
+      adapter.getBasePath(),
+      this.app.vault.configDir,
+      "plugins",
+      this.manifest.id,
+      "certs"
+    );
+    await fs.mkdir(certsDir, { recursive: true, mode: 0o700 });
+    await fs.writeFile(path.join(certsDir, "key.pem"), privateKey, { mode: 0o600 });
   }
 
   getPublicApi(pluginManifest: PluginManifest): LocalRestApiPublicApi {
@@ -197,78 +168,136 @@ export default class LocalRestApi extends Plugin {
     return this.requestHandler.registerApiExtension(pluginManifest);
   }
 
-  debounce<F extends (...args: unknown[]) => unknown>(
-    func: F,
-    delay: number
-  ): (...args: Parameters<F>) => void {
-    let debounceTimer: number;
-    return (...args: Parameters<F>): void => {
-      window.clearTimeout(debounceTimer);
-      debounceTimer = window.setTimeout(() => func(...args), delay);
-    };
+  getServerStatus(protocol: ServerProtocol): ServerStatus {
+    return this.serverStatus[protocol];
+  }
+
+  onServerStatusChange(listener: () => void): () => void {
+    this.serverStatusListeners.add(listener);
+    return () => { this.serverStatusListeners.delete(listener); };
+  }
+
+  private notifyServerStatusChange() {
+    for (const listener of this.serverStatusListeners) listener();
+  }
+
+  refreshServerState() {
+    this.scheduleServerRefresh(1000);
   }
 
   _refreshServerState() {
-    if (this.secureServer) {
-      this.secureServer.closeAllConnections();
-      this.secureServer.close();
-      this.secureServer = null;
-    }
-    if ((this.settings.enableSecureServer ?? true) && this.settings.crypto) {
-      this.secureServer = https.createServer(
-        {
-          key: this.settings.crypto.privateKey,
-          cert: this.settings.crypto.cert,
-        },
-        this.requestHandler.api
-      );
-      configureHttpServerTimeouts(this.secureServer);
-      this.secureServer.listen(
-        this.settings.port,
-        this.settings.bindingHost ?? DefaultBindingHost
-      );
+    this.scheduleServerRefresh(0);
+  }
 
-      if (this.settings.enableVerboseLogging) {
-        console.debug(
-          `[REST API] Listening on https://${
-            this.settings.bindingHost ?? DefaultBindingHost
-          }:${this.settings.port}/`
-        );
-      }
+  private scheduleServerRefresh(delay: number) {
+    if (this.unloaded) return;
+    window.clearTimeout(this.refreshTimer);
+    const generation = ++this.refreshGeneration;
+    const queue = () => {
+      this.serverRefresh = this.serverRefresh
+        .then(() => this.restartServers(generation))
+        .catch((error) => {
+          console.error("[REST API] Could not restart the servers", error);
+        });
+    };
+    this.serverStatus = {
+      HTTPS: { state: (this.settings.enableSecureServer ?? true) ? "starting" : "off" },
+      HTTP: { state: this.settings.enableInsecureServer ? "starting" : "off" },
+    };
+    if (delay > 0) {
+      this.refreshTimer = window.setTimeout(queue, delay);
+    } else {
+      this.refreshTimer = undefined;
+      queue();
     }
+    this.notifyServerStatusChange();
+  }
 
-    if (this.insecureServer) {
-      this.insecureServer.closeAllConnections();
-      this.insecureServer.close();
-      this.insecureServer = null;
+  private isCurrentRefresh(generation: number): boolean {
+    return !this.unloaded && generation === this.refreshGeneration;
+  }
+
+  private async restartServers(generation: number) {
+    if (!this.isCurrentRefresh(generation)) return;
+    const previous = [this.secureServer, this.insecureServer];
+    this.secureServer = null;
+    this.insecureServer = null;
+    // Binding again before the old servers have let go of their ports would
+    // fail with EADDRINUSE on the port we are about to reuse.
+    await Promise.all(previous.map(closeServer));
+    if (!this.isCurrentRefresh(generation)) return;
+
+    const host = this.settings.bindingHost ?? DefaultBindingHost;
+    if (this.settings.enableSecureServer ?? true) {
+      this.startServer("HTTPS", host, this.settings.port, generation);
     }
     if (this.settings.enableInsecureServer) {
-      this.insecureServer = http.createServer(this.requestHandler.api);
-      configureHttpServerTimeouts(this.insecureServer);
-      this.insecureServer.listen(
-        this.settings.insecurePort,
-        this.settings.bindingHost ?? DefaultBindingHost
-      );
+      this.startServer("HTTP", host, this.settings.insecurePort, generation);
+    }
+  }
 
-      if (this.settings.enableVerboseLogging) {
-        console.debug(
-          `[REST API] Listening on http://${
-            this.settings.bindingHost ?? DefaultBindingHost
-          }:${this.settings.insecurePort}/`
-        );
+  private startServer(
+    protocol: ServerProtocol,
+    host: string,
+    port: number,
+    generation: number,
+  ) {
+    let server: https.Server | http.Server | undefined;
+    const onError = (error: NodeJS.ErrnoException) => {
+      // An error accepting one connection does not mean the listener stopped.
+      if (server?.listening) {
+        console.error(`[REST API] ${protocol} server error on ${host}:${port}`, error);
+        return;
       }
+      if (server && this.secureServer === server) this.secureServer = null;
+      if (server && this.insecureServer === server) this.insecureServer = null;
+      // An earlier bind can finish during the debounce for the next refresh.
+      if (!this.isCurrentRefresh(generation)) return;
+      console.error(`[REST API] ${protocol} server error on ${host}:${port}`, error);
+      const reason = describeServerError(error, protocol, host, port);
+      this.serverStatus[protocol] = { state: "failed", reason };
+      new Notice(reason);
+      this.notifyServerStatusChange();
+    };
+
+    try {
+      if (protocol === "HTTPS") {
+        const crypto = this.settings.crypto;
+        if (!crypto) throw new Error("No TLS certificate is configured.");
+        server = this.secureServer = https.createServer(
+          { key: crypto.privateKey, cert: buildServerCertificateChain(crypto) },
+          this.requestHandler.api,
+        );
+      } else {
+        server = this.insecureServer = http.createServer(this.requestHandler.api);
+      }
+      configureHttpServerTimeouts(server);
+      listenServer(server, port, host, {
+        onListening: () => {
+          if (!this.isCurrentRefresh(generation)) return;
+          if (this.settings.enableVerboseLogging) {
+            console.debug(
+              `[REST API] Listening on ${protocol.toLowerCase()}://${host}:${port}/`
+            );
+          }
+          this.serverStatus[protocol] = { state: "listening" };
+          this.notifyServerStatusChange();
+        },
+        onError,
+      });
+    } catch (error) {
+      onError(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
   onunload() {
-    if (this.secureServer) {
-      this.secureServer.closeAllConnections();
-      this.secureServer.close();
-    }
-    if (this.insecureServer) {
-      this.insecureServer.closeAllConnections();
-      this.insecureServer.close();
-    }
+    this.unloaded = true;
+    ++this.refreshGeneration;
+    window.clearTimeout(this.refreshTimer);
+    this.serverStatusListeners.clear();
+    this.requestHandler?.dispose();
+    void closeServer(this.secureServer);
+    void closeServer(this.insecureServer);
   }
 
   async loadSettings() {
@@ -299,241 +328,305 @@ export default class LocalRestApi extends Plugin {
   }
 }
 
-class LocalRestApiSettingTab extends PluginSettingTab {
+export class LocalRestApiSettingTab extends PluginSettingTab {
   plugin: LocalRestApi;
-  showAdvancedSettings = false;
 
   constructor(app: App, plugin: LocalRestApi) {
     super(app, plugin);
     this.plugin = plugin;
   }
 
-  display(): void {
-    const { containerEl } = this;
-    containerEl.replaceChildren();
+  /**
+   * Summarises the stored certificate material for the settings UI. See
+   * getReportedValidityDays for which certificate's expiry is reported.
+   */
+  private getCertificateStatus(): {
+    remainingCertificateValidityDays: number | null;
+    standardsIssue: CertificateStandardsIssue | null;
+  } {
+    const crypto = this.plugin.settings.crypto;
+    if (!crypto) {
+      return { remainingCertificateValidityDays: null, standardsIssue: null };
+    }
+    let standardsIssue: CertificateStandardsIssue | null = null;
+    try {
+      standardsIssue = getCertificateStandardsIssue(forge.pki.certificateFromPem(crypto.cert));
+    } catch {
+      // Unparseable material: nothing to say about its standards either.
+    }
+    return {
+      remainingCertificateValidityDays: getReportedValidityDays(crypto),
+      standardsIssue,
+    };
+  }
 
-    const parsedCertificate = this.plugin.settings.crypto && forge.pki.certificateFromPem(
-      this.plugin.settings.crypto.cert
-    );
-    const remainingCertificateValidityDays = parsedCertificate &&
-      getCertificateValidityDays(parsedCertificate);
-    const shouldRegenerateCertificate = parsedCertificate &&
-      !getCertificateIsUptoStandards(parsedCertificate);
+  /**
+   * Renders a value in a `pre` block with a button that copies it.
+   *
+   * These blocks are styled `user-select: all`, so a single click already
+   * selects the whole value -- but nothing about them says so. The button is
+   * the discoverable version of that affordance.
+   *
+   * `label` names the value in the tooltip and in the confirmation notice, so
+   * it reads as a lowercase noun phrase ("API key", not "Copy API Key").
+   */
+  private renderCopyableValue(
+    el: HTMLElement,
+    value: string,
+    label: string,
+    cls = "copyable-value"
+  ): void {
+    const wrapper = el.createDiv({ cls });
+    wrapper.createEl("pre", { text: value });
+    new ExtraButtonComponent(wrapper)
+      .setIcon("copy")
+      .setTooltip(t("copy.tooltip", { label }))
+      .onClick(() => {
+        void this.copyToClipboard(value, label);
+      });
+  }
 
-    containerEl.empty();
-    containerEl.classList.add("obsidian-local-rest-api-settings");
-    new Setting(containerEl).setHeading().setName("Local REST API & MCP server");
-    new Setting(containerEl).setHeading().setName("How to access via REST");
+  private async copyToClipboard(value: string, label: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(value);
+      new Notice(t("copy.success", { label }));
+    } catch {
+      // writeText rejects when the document is not focused or the platform
+      // refuses permission. The notice is this button's only feedback, so
+      // swallowing the rejection would make a failed copy indistinguishable
+      // from a successful one.
+      new Notice(t("copy.failure", { label }));
+    }
+  }
 
-    const apiKeyDiv = containerEl.createDiv();
+  /**
+   * Returns the extra hostnames configured for the certificate, one URL table
+   * row (and certificate `subjectAltName`) per non-blank line.
+   */
+  private getSubjectAltNames(): string[] {
+    return (this.plugin.settings.subjectAltNames ?? "")
+      .split("\n")
+      .map((name) => name.trim())
+      .filter((name) => name.length > 0);
+  }
+
+  /**
+   * Renders the two-row (HTTPS/HTTP) URL table used by the main settings page
+   * and both "How to access" pages. Each URL gets the copy-button treatment.
+   *
+   * `pathSuffix` is appended to every URL (`/` for the API root, `/mcp/` for
+   * the MCP endpoint). `disabledHint` tells the reader where the enable
+   * switches live, which differs between the main page ("below") and the
+   * sub-pages (back on the main page). The certificate note is instructional,
+   * so the main page's status table leaves it off.
+   */
+  private renderServerUrlTable(
+    el: HTMLElement,
+    options: {
+      pathSuffix: string;
+      secureName: string;
+      insecureName: string;
+      copyLabel: string;
+      includeCertificateNote: boolean;
+      disabledHint: string;
+    }
+  ): () => void {
+    const table = el.createEl("table", { cls: "api-urls" });
+    const tbody = table.createEl("tbody");
+
+    const addRow = (row: {
+      protocol: ServerProtocol;
+      name: string;
+      urls: string[];
+      note?: (noteEl: HTMLElement) => void;
+    }) => {
+      const status = this.plugin.getServerStatus(row.protocol);
+      const appearance = {
+        off: { icon: "❌", label: t("status.off") },
+        starting: { icon: "⏳", label: t("status.starting") },
+        listening: { icon: "✅", label: t("status.listening") },
+        failed: { icon: "⚠️", label: t("status.failed") },
+      }[status.state];
+      const tr = tbody.createEl("tr");
+      if (status.state === "off") {
+        tr.addClass("disabled");
+        tr.title = options.disabledHint;
+      }
+      tr.createEl("td", { text: appearance.icon, attr: { "aria-hidden": "true" } });
+      const nameTd = tr.createEl("td", { cls: "name" });
+      nameTd.createSpan({ text: row.name });
+      nameTd.createDiv({ cls: "server-status-label", text: appearance.label });
+      if (status.state === "failed") {
+        nameTd.createDiv({ cls: "server-status-reason", text: status.reason });
+      }
+      if (row.note) {
+        nameTd.createEl("br");
+        nameTd.createEl("br");
+        row.note(nameTd.createEl("i"));
+      }
+      const urlTd = tr.createEl("td", { cls: "url" });
+      for (const url of row.urls) {
+        this.renderCopyableValue(urlTd, url, options.copyLabel);
+      }
+    };
+
+    const certificateLinkLabel = t("link.certificate");
+    const wikiLinkLabel = t("link.wiki");
+
+    let rendered = false;
+    let unsubscribe: () => void = () => undefined;
+    const render = () => {
+      if (rendered && !table.isConnected) {
+        unsubscribe();
+        return;
+      }
+      rendered = true;
+      const settings = this.plugin.settings;
+      const altNames = this.getSubjectAltNames();
+      tbody.empty();
+      addRow({
+        protocol: "HTTPS",
+        name: options.secureName,
+        urls: [
+          `https://127.0.0.1:${settings.port}${options.pathSuffix}`,
+          ...altNames.map(
+            (name) => `https://${name}:${settings.port}${options.pathSuffix}`
+          ),
+        ],
+        note: options.includeCertificateNote
+          ? (noteEl) => {
+              const certUrl = `https://127.0.0.1:${settings.port}/${CERT_NAME}`;
+              const wikiUrl =
+                "https://github.com/coddingtonbear/obsidian-web/wiki/How-do-I-get-my-browser-trust-my-Obsidian-Local-REST-API-certificate%3F";
+
+              renderTemplate(noteEl, t("rest.secureNote"), {
+                link: (parent) =>
+                  parent.createEl("a", {
+                    href: certUrl,
+                    text: certificateLinkLabel,
+                  }),
+                wikiLink: (parent) =>
+                  parent.createEl("a", {
+                    href: wikiUrl,
+                    text: wikiLinkLabel,
+                  }),
+              });
+            }
+          : undefined,
+      });
+
+      addRow({
+        protocol: "HTTP",
+        name: options.insecureName,
+        urls: [
+          `http://127.0.0.1:${settings.insecurePort}${options.pathSuffix}`,
+          ...altNames.map(
+            (name) => `http://${name}:${settings.insecurePort}${options.pathSuffix}`
+          ),
+        ],
+      });
+    };
+
+    render();
+    unsubscribe = this.plugin.onServerStatusChange(render);
+    return unsubscribe;
+  }
+
+  private renderConnectionInfo(el: HTMLElement): () => void {
+    const apiKeyDiv = el.createDiv();
     apiKeyDiv.classList.add("api-key-display");
 
     apiKeyDiv.createEl("p", {
-      text: "You can access Obsidian local REST API & MCP server via the following URLs:",
+      text: t("rest.intro"),
     });
 
-    const addUrlRow = (container: HTMLElement, url: string) => {
-      container.createEl("pre", { text: url });
-    };
-
-    const connectionUrls = apiKeyDiv.createEl("table", { cls: "api-urls" });
-    const connectionUrlsTbody = connectionUrls.createEl("tbody");
-    const secureTr = connectionUrlsTbody.createEl(
-      "tr",
-      this.plugin.settings.enableSecureServer === false
-        ? {
-            cls: "disabled",
-            title: "Disabled.  You can enable this in 'Settings' below.",
-          }
-        : {
-            title: "Enabled",
-          }
-    );
-    const secureUrl = `https://127.0.0.1:${this.plugin.settings.port}/`;
-
-    secureTr.createEl("td", {
-      text: this.plugin.settings.enableSecureServer === false ? "❌" : "✅",
+    const unsubscribe = this.renderServerUrlTable(apiKeyDiv, {
+      pathSuffix: "/",
+      secureName: t("rest.secureName"),
+      insecureName: t("rest.insecureName"),
+      copyLabel: t("rest.endpointUrl"),
+      includeCertificateNote: true,
+      disabledHint: t("rest.disabledHintSubPage"),
     });
-    const secureNameTd = secureTr.createEl("td", { cls: "name" });
-    secureNameTd.createSpan({ text: "Encrypted (HTTPS) API URL" });
-    secureNameTd.createEl("br");
-    secureNameTd.createEl("br");
-    const secureNote = secureNameTd.createEl("i");
-    secureNote.createSpan({ text: "Requires that " });
-    secureNote.createEl("a", {
-      href: `https://127.0.0.1:${this.plugin.settings.port}/${CERT_NAME}`,
-      // eslint-disable-next-line obsidianmd/ui/sentence-case
-      text: "this certificate",
-    });
-    secureNote.createSpan({
-      text: " be configured as a trusted certificate authority for your browser.  See ",
-    });
-    secureNote.createEl("a", {
-      href: "https://github.com/coddingtonbear/obsidian-web/wiki/How-do-I-get-my-browser-trust-my-Obsidian-Local-REST-API-certificate%3F",
-      // eslint-disable-next-line obsidianmd/ui/sentence-case
-      text: "wiki",
-    });
-    secureNote.createSpan({ text: " for more information." });
-
-    const secureUrlsTd = secureTr.createEl("td", { cls: "url" });
-    addUrlRow(secureUrlsTd, secureUrl);
-    if (this.plugin.settings.subjectAltNames) {
-      for (const name of this.plugin.settings.subjectAltNames.split("\n")) {
-        if (name.trim()) {
-          addUrlRow(
-            secureUrlsTd,
-            `https://${name.trim()}:${this.plugin.settings.port}/`
-          );
-        }
-      }
-    }
-
-    const insecureTr = connectionUrlsTbody.createEl(
-      "tr",
-      this.plugin.settings.enableInsecureServer === false
-        ? {
-            cls: "disabled",
-            title: "Disabled.  You can enable this in 'Settings' below.",
-          }
-        : {
-            title: "Enabled",
-          }
-    );
-    const insecureUrl = `http://127.0.0.1:${this.plugin.settings.insecurePort}/`;
-
-    insecureTr.createEl("td", {
-      text: this.plugin.settings.enableInsecureServer === false ? "❌" : "✅",
-    });
-    insecureTr.createEl("td", { cls: "name", text: "Non-encrypted (HTTP) API URL" });
-
-    const insecureUrlsTd = insecureTr.createEl("td", { cls: "url" });
-    addUrlRow(insecureUrlsTd, insecureUrl);
-    if (this.plugin.settings.subjectAltNames) {
-      for (const name of this.plugin.settings.subjectAltNames.split("\n")) {
-        if (name.trim()) {
-          addUrlRow(
-            insecureUrlsTd,
-            `http://${name.trim()}:${this.plugin.settings.insecurePort}/`
-          );
-        }
-      }
-    }
 
     const authHeaderP = apiKeyDiv.createEl("p");
-    authHeaderP.createSpan({
-      text: "Your API key should be passed as a bearer token via the ",
+    const headerName =
+      this.plugin.settings.authorizationHeaderName ??
+      DefaultBearerTokenHeaderName;
+    renderTemplate(authHeaderP, t("rest.authHeader"), {
+      header: (parent) => parent.createEl("code", { text: headerName }),
     });
-    authHeaderP.createEl("code", {
-      text:
-        this.plugin.settings.authorizationHeaderName ??
-        DefaultBearerTokenHeaderName,
-    });
-    authHeaderP.createSpan({ text: " header:" });
 
-    apiKeyDiv.createEl("pre", {
-      text: `Bearer ${this.plugin.settings.apiKey}`,
+    this.renderCopyableValue(
+      apiKeyDiv,
+      `Bearer ${this.plugin.settings.apiKey}`,
+      t("rest.authLabel"),
+    );
+
+    apiKeyDiv.createEl("p", {
+      text: t("rest.apiKeyHint"),
     });
+    this.renderCopyableValue(
+      apiKeyDiv,
+      this.plugin.settings.apiKey ?? "",
+      t("setting.apiKey"),
+    );
+
     const seeMore = apiKeyDiv.createEl("p");
-    seeMore.createSpan({
-      text: "Comprehensive documentation of what API endpoints are available can be found in ",
+    renderTemplate(seeMore, t("rest.seeMore"), {
+      docsLink: (parent) =>
+        parent.createEl("a", {
+          href: "https://coddingtonbear.github.io/obsidian-local-rest-api/",
+          text: t("link.docs"),
+        }),
     });
-    seeMore.createEl("a", {
-      href: "https://coddingtonbear.github.io/obsidian-local-rest-api/",
-      // eslint-disable-next-line obsidianmd/ui/sentence-case
-      text: "the online docs",
-    });
-    seeMore.createSpan({ text: "." });
 
-    new Setting(containerEl).setHeading().setName("How to access via MCP");
+    return unsubscribe;
+  }
 
-    const mcpDiv = containerEl.createDiv();
+  private renderMcpInfo(el: HTMLElement): () => void {
+    const mcpDiv = el.createDiv();
     mcpDiv.classList.add("mcp-display");
 
     mcpDiv.createEl("p", {
-      text: "You can connect to the MCP server via the following endpoints:",
+      text: t("mcp.intro"),
     });
 
-    const mcpUrls = mcpDiv.createEl("table", { cls: "api-urls" });
-    const mcpUrlsTbody = mcpUrls.createEl("tbody");
+    const unsubscribe = this.renderServerUrlTable(mcpDiv, {
+      pathSuffix: "/mcp/",
+      secureName: t("mcp.secureName"),
+      insecureName: t("mcp.insecureName"),
+      copyLabel: t("mcp.endpointUrl"),
+      includeCertificateNote: true,
+      disabledHint: t("mcp.disabledHint"),
+    });
 
-    const mcpSecureTr = mcpUrlsTbody.createEl(
-      "tr",
-      this.plugin.settings.enableSecureServer === false
-        ? {
-            cls: "disabled",
-            title: "Disabled.  You can enable this in 'Settings' below.",
-          }
-        : {
-            title: "Enabled",
-          }
-    );
     const mcpSecureUrl = `https://127.0.0.1:${this.plugin.settings.port}/mcp/`;
-
-    mcpSecureTr.createEl("td", {
-      text: this.plugin.settings.enableSecureServer === false ? "❌" : "✅",
-    });
-    const mcpSecureNameTd = mcpSecureTr.createEl("td", { cls: "name" });
-    mcpSecureNameTd.createSpan({ text: "Encrypted (HTTPS) MCP Endpoint" });
-    mcpSecureNameTd.createEl("br");
-    mcpSecureNameTd.createEl("br");
-    const mcpSecureNote = mcpSecureNameTd.createEl("i");
-    mcpSecureNote.createSpan({ text: "Requires that " });
-    mcpSecureNote.createEl("a", {
-      href: `https://127.0.0.1:${this.plugin.settings.port}/${CERT_NAME}`,
-      // eslint-disable-next-line obsidianmd/ui/sentence-case
-      text: "this certificate",
-    });
-    mcpSecureNote.createSpan({
-      text: " be configured as a trusted certificate authority.  See ",
-    });
-    mcpSecureNote.createEl("a", {
-      href: "https://github.com/coddingtonbear/obsidian-web/wiki/How-do-I-get-my-browser-trust-my-Obsidian-Local-REST-API-certificate%3F",
-      // eslint-disable-next-line obsidianmd/ui/sentence-case
-      text: "wiki",
-    });
-    mcpSecureNote.createSpan({ text: " for more information." });
-
-    const mcpSecureUrlsTd = mcpSecureTr.createEl("td", { cls: "url" });
-    addUrlRow(mcpSecureUrlsTd, mcpSecureUrl);
-
-    const mcpInsecureTr = mcpUrlsTbody.createEl(
-      "tr",
-      this.plugin.settings.enableInsecureServer === false
-        ? {
-            cls: "disabled",
-            title: "Disabled.  You can enable this in 'Settings' below.",
-          }
-        : {
-            title: "Enabled",
-          }
-    );
-    const mcpInsecureUrl = `http://127.0.0.1:${this.plugin.settings.insecurePort}/mcp/`;
-
-    mcpInsecureTr.createEl("td", {
-      text: this.plugin.settings.enableInsecureServer === false ? "❌" : "✅",
-    });
-    mcpInsecureTr.createEl("td", {
-      cls: "name",
-      text: "Non-encrypted (HTTP) MCP endpoint",
-    });
-
-    const mcpInsecureUrlsTd = mcpInsecureTr.createEl("td", { cls: "url" });
-    addUrlRow(mcpInsecureUrlsTd, mcpInsecureUrl);
 
     const headerName =
       this.plugin.settings.authorizationHeaderName ??
       DefaultBearerTokenHeaderName;
 
     const mcpAuthHeaderP = mcpDiv.createEl("p");
-    mcpAuthHeaderP.createSpan({
-      text: "Your API key should be passed as a bearer token via the ",
+    renderTemplate(mcpAuthHeaderP, t("mcp.authHeader"), {
+      header: (parent) => parent.createEl("code", { text: headerName }),
     });
-    mcpAuthHeaderP.createEl("code", { text: headerName });
-    mcpAuthHeaderP.createSpan({ text: " header:" });
 
-    mcpDiv.createEl("pre", {
-      text: `Bearer ${this.plugin.settings.apiKey}`,
+    this.renderCopyableValue(
+      mcpDiv,
+      `Bearer ${this.plugin.settings.apiKey}`,
+      t("mcp.authLabel"),
+    );
+
+    mcpDiv.createEl("p", {
+      text: t("mcp.apiKeyHint"),
     });
+    this.renderCopyableValue(
+      mcpDiv,
+      this.plugin.settings.apiKey ?? "",
+      t("setting.apiKey"),
+    );
+
     const mcpSampleConfig = JSON.stringify(
       {
         mcpServers: {
@@ -551,326 +644,576 @@ class LocalRestApiSettingTab extends PluginSettingTab {
     );
 
     mcpDiv.createEl("p", {
-      text: "Example Claude code MCP configuration (for .Claude/settings.json):",
+      text: t("mcp.example"),
     });
     mcpDiv.createEl("pre", { text: mcpSampleConfig });
 
     const mcpSeeMore = mcpDiv.createEl("p");
-    mcpSeeMore.createSpan({
-      text: "Configuration examples for other MCP clients can be found in ",
+    renderTemplate(mcpSeeMore, t("mcp.seeMore"), {
+      docsLink: (parent) =>
+        parent.createEl("a", {
+          href: "https://github.com/coddingtonbear/obsidian-local-rest-api#readme",
+          text: t("link.readme"),
+        }),
     });
-    mcpSeeMore.createEl("a", {
-      href: "https://github.com/coddingtonbear/obsidian-local-rest-api#readme",
-      // eslint-disable-next-line obsidianmd/ui/sentence-case
-      text: "the project readme",
-    });
-    mcpSeeMore.createSpan({ text: "." });
 
-    new Setting(containerEl).setHeading().setName("Settings");
+    return unsubscribe;
+  }
 
-    if (remainingCertificateValidityDays && remainingCertificateValidityDays < 0) {
-      const expiredCertDiv = apiKeyDiv.createDiv();
+  private renderCertificateWarnings(el: HTMLElement): void {
+    const { remainingCertificateValidityDays, standardsIssue } =
+      this.getCertificateStatus();
+
+    if (remainingCertificateValidityDays !== null && remainingCertificateValidityDays < 0) {
+      const expiredCertDiv = el.createDiv();
       expiredCertDiv.classList.add("certificate-expired");
-      expiredCertDiv.createEl("b", { text: "Your certificate has expired!" });
+      expiredCertDiv.createEl("b", { text: t("status.expired") });
       expiredCertDiv.createSpan({
-        text: ' You must re-generate your certificate below by pressing the "Re-generate Certificates" button below in order to connect securely to this API.',
+        text: t("status.expiredDesc"),
       });
-    } else if (remainingCertificateValidityDays &&remainingCertificateValidityDays < 30) {
-      const soonExpiringCertDiv = apiKeyDiv.createDiv();
+    } else if (remainingCertificateValidityDays !== null && remainingCertificateValidityDays < 30) {
+      const soonExpiringCertDiv = el.createDiv();
       soonExpiringCertDiv.classList.add("certificate-expiring-soon");
       const daysRemaining = Math.floor(remainingCertificateValidityDays);
       soonExpiringCertDiv.createEl("b", {
-        text: `Your certificate will expire in ${daysRemaining} day${daysRemaining === 1 ? "" : "s"}!`,
+        text: tPlural("status.expiringSoon", daysRemaining),
       });
       soonExpiringCertDiv.createSpan({
-        text: ' You should re-generate your certificate below by pressing the "Re-generate Certificates" button below in order to continue to connect securely to this API.',
+        text: t("status.expiringDesc"),
       });
     }
-    if (shouldRegenerateCertificate) {
-      const shouldRegenerateCertificateDiv = apiKeyDiv.createDiv();
+    if (standardsIssue === "legacy-ipv4-san") {
+      const shouldRegenerateCertificateDiv = el.createDiv();
       shouldRegenerateCertificateDiv.classList.add(
         "certificate-regeneration-recommended"
       );
       shouldRegenerateCertificateDiv.createEl("b", {
-        text: "You should re-generate your certificate!",
+        text: t("status.regenerate"),
       });
       shouldRegenerateCertificateDiv.createSpan({
-        text: " Your certificate was generated using earlier standards than are currently used by Obsidian Local REST API & MCP Server. Some systems or tools may not accept your certificate with its current configuration, and re-generating your certificate may improve compatibility with such tools.  To re-generate your certificate, press the \"Re-generate Certificates\" button below.",
+        text: t("status.regenerateDesc"),
+      });
+    } else if (standardsIssue === "ca-used-as-leaf") {
+      // Deliberately mild: nothing is broken for anyone this certificate
+      // already works for, and regenerating costs them a re-import.
+      const updateAvailableDiv = el.createDiv();
+      updateAvailableDiv.classList.add("certificate-update-available");
+      updateAvailableDiv.createSpan({
+        text: t("cert.caUpdate"),
       });
     }
+  }
 
-    new Setting(containerEl)
-      .setName("Enable non-encrypted (HTTP) server")
-      .setDesc(
-        "Enables a non-encrypted (HTTP) server on the port designated below.  By default this plugin requires a secure HTTPS connection, but in safe environments you may turn on the non-encrypted server to simplify interacting with the API. Interactions with the API will still require the API key shown above.  Under no circumstances is it recommended that you expose this service to the internet, especially if you turn on this feature!"
-      )
-      .addToggle((cb) =>
-        cb
-          .onChange((value) => {
-            const originalValue = this.plugin.settings.enableInsecureServer;
-            this.plugin.settings.enableInsecureServer = value;
-            void this.plugin.saveSettings();
-            this.plugin.refreshServerState();
-            // If our target value differs,
-            if (value !== originalValue) {
-              this.display();
-            }
-          })
-          .setValue(this.plugin.settings.enableInsecureServer)
-      );
+  /**
+   * Prepares a setting item to hold arbitrary block content, and returns the
+   * element to render into.
+   *
+   * Two things are going on here. `.setting-item` lays its children out as a
+   * flex row -- name/desc on the left, control on the right -- so block content
+   * written straight into one ends up side-by-side rather than stacked. And
+   * every styles.css rule for content this plugin renders itself is scoped to
+   * the class added here.
+   *
+   * That scope lives on the setting item rather than on the settings tab's
+   * containerEl on purpose: a `type: "page"` item renders into its own
+   * SettingPage container, which is not a descendant of containerEl, so a rule
+   * scoped to the tab root silently stops applying once the content moves onto
+   * the Certificates or Advanced settings page.
+   */
+  private prepareCustomContent(setting: Setting): HTMLElement {
+    setting.settingEl.empty();
+    setting.settingEl.addClass("obsidian-local-rest-api-content");
+    return setting.settingEl;
+  }
 
-    new Setting(containerEl)
-      .setName("Reset all cryptography")
-      .setDesc(
-        `Pressing this button will cause your certificate,
-        private key, public key, and API key to be regenerated.
-        This settings panel will be closed when you press this.`
-      )
-      .addButton((cb) => {
-        cb.setWarning()
-          .setButtonText("Reset all crypto")
-          .onClick(() => {
-            delete this.plugin.settings.apiKey;
-            delete this.plugin.settings.crypto;
-            void this.plugin.saveSettings();
-            this.plugin.unload();
-            this.plugin.load();
+  private confirmDestructiveAction(options: {
+    title: string;
+    message: string;
+    confirmText: string;
+    onConfirm: () => void;
+  }): void {
+    const modal = new ConfirmationModal(this.app);
+    modal.titleEl.setText(options.title);
+    modal.contentEl.createEl("p", { text: options.message });
+    modal.addButton((btn) => {
+      btn.setButtonText(options.confirmText)
+        .setDestructive()
+        .onClick(() => {
+          options.onConfirm();
+        });
+    });
+    modal.addCancelButton();
+    modal.open();
+  }
+
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    this.containerEl.classList.add("obsidian-local-rest-api-settings");
+
+    const { remainingCertificateValidityDays, standardsIssue } =
+      this.getCertificateStatus();
+
+    const certificateDisplayValue = (): string => {
+      if (remainingCertificateValidityDays === null) return "";
+      if (remainingCertificateValidityDays < 0) return t("cert.expired");
+      if (remainingCertificateValidityDays < 30) {
+        const days = Math.floor(remainingCertificateValidityDays);
+        return tPlural("cert.expiresIn", days);
+      }
+      if (standardsIssue === "legacy-ipv4-san") return t("cert.shouldRegenerate");
+      if (standardsIssue === "ca-used-as-leaf") return t("cert.updateAvailable");
+      return t("cert.valid");
+    };
+
+    return [
+      {
+        type: "group",
+        items: [
+          {
+            name: t("rest.serverStatus"),
+            render: (setting) => {
+              const el = this.prepareCustomContent(setting);
+              return this.renderServerUrlTable(el, {
+                pathSuffix: "/",
+                secureName: t("rest.secureServerName"),
+                insecureName: t("rest.insecureServerName"),
+                copyLabel: t("rest.serverUrlCopyLabel"),
+                includeCertificateNote: false,
+                disabledHint: t("rest.disabledHintBelow"),
+              });
+            },
+          },
+          {
+            name: t("setting.apiKey"),
+            desc: t("rest.apiKeyDesc", {
+              header:
+                this.plugin.settings.authorizationHeaderName ??
+                DefaultBearerTokenHeaderName,
+            }),
+            render: (setting) => {
+              this.renderCopyableValue(
+                setting.controlEl,
+                this.plugin.settings.apiKey ?? "",
+                t("setting.apiKey"),
+                "inline-copyable-value"
+              );
+            },
+          },
+          {
+            type: "page",
+            name: t("heading.rest"),
+            desc: t("rest.howToAccessDesc"),
+            items: [
+              {
+                name: t("heading.rest"),
+                render: (setting) => {
+                  return this.renderConnectionInfo(this.prepareCustomContent(setting));
+                },
+              },
+            ],
+          },
+          {
+            type: "page",
+            name: t("heading.mcp"),
+            desc: t("mcp.howToAccessDesc"),
+            items: [
+              {
+                name: t("heading.mcp"),
+                render: (setting) => {
+                  return this.renderMcpInfo(this.prepareCustomContent(setting));
+                },
+              },
+            ],
+          },
+        ],
+      },
+      {
+        type: "group",
+        heading: t("heading.settings"),
+        items: [
+          {
+            name: t("setting.insecureServer"),
+            desc: t("setting.insecureServerDesc"),
+            control: { type: "toggle", key: "enableInsecureServer" },
+          },
+          {
+            type: "page",
+            name: t("setting.certificates"),
+            desc: t("setting.certificatesDesc"),
+            displayValue: certificateDisplayValue,
+            status: standardsIssue === "legacy-ipv4-san" ? "warning" : null,
+            items: this.getCertificateSettingDefinitions(),
+          },
+          {
+            name: t("setting.resetCrypto"),
+            desc: t("setting.resetCryptoDesc"),
+            render: (setting) => {
+              setting.addButton((cb) => {
+                cb.setButtonText(t("setting.resetCryptoBtn"))
+                  .setDestructive()
+                  .onClick(() => {
+                    this.confirmDestructiveAction({
+                      title: t("modal.resetTitle"),
+                      message: t("modal.resetMessage"),
+                      confirmText: t("setting.resetCryptoBtn"),
+                      onConfirm: () => {
+                        delete this.plugin.settings.apiKey;
+                        delete this.plugin.settings.crypto;
+                        void this.plugin.saveSettings();
+                        this.plugin.unload();
+                        this.plugin.load();
+                      },
+                    });
+                  });
+              });
+            },
+          },
+          {
+            name: t("setting.restoreDefaults"),
+            desc: t("setting.restoreDefaultsDesc"),
+            render: (setting) => {
+              setting.addButton((cb) => {
+                cb.setButtonText(t("setting.restoreDefaultsBtn"))
+                  .setDestructive()
+                  .onClick(() => {
+                    this.confirmDestructiveAction({
+                      title: t("modal.restoreTitle"),
+                      message: t("modal.restoreMessage"),
+                      confirmText: t("setting.restoreDefaultsBtn"),
+                      onConfirm: () => {
+                        this.plugin.settings = Object.assign({}, DEFAULT_SETTINGS);
+                        void this.plugin.saveSettings();
+                        this.plugin.unload();
+                        this.plugin.load();
+                      },
+                    });
+                  });
+              });
+            },
+          },
+          {
+            type: "page",
+            name: t("setting.advancedSettingsHeading"),
+            desc: t("setting.advancedSettingsDesc"),
+            items: this.getAdvancedSettingDefinitions(),
+          },
+        ],
+      },
+    ];
+  }
+
+  private getAdvancedSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        name: t("advanced.license"),
+        render: (setting) => {
+          const el = this.prepareCustomContent(setting);
+          el.createEl("p", {
+            text: t("advanced.warning"),
           });
-      });
-
-    new Setting(containerEl)
-      .setName("Re-generate certificates")
-      .setDesc(
-        `Pressing this button will cause your certificate,
-        private key,  and public key to be re-generated, but your API key will remain unchanged. 
-        This settings panel will be closed when you press this.`
-      )
-      .addButton((cb) => {
-        cb.setWarning()
-          .setButtonText("Re-generate certificates")
-          .onClick(() => {
-            delete this.plugin.settings.crypto;
-            void this.plugin.saveSettings();
-            this.plugin.unload();
-            this.plugin.load();
+          const noWarrantee = el.createEl("p");
+          renderTemplate(noWarrantee, t("advanced.noWarranty"), {
+            licenseLink: (parent) =>
+              parent.createEl("a", { href: LicenseUrl, text: LicenseUrl }),
           });
-      });
+        },
+      },
+      {
+        name: t("setting.enableSecureServer"),
+        desc: t("setting.enableSecureServerDesc"),
+        control: { type: "toggle", key: "enableSecureServer" },
+      },
+      {
+        name: t("setting.securePort"),
+        desc: t("setting.securePortDesc"),
+        control: { type: "number", key: "port", min: 1, max: 65535 },
+      },
+      {
+        name: t("setting.insecurePort"),
+        control: { type: "number", key: "insecurePort", min: 1, max: 65535 },
+      },
+      {
+        name: t("setting.apiKey"),
+        control: { type: "text", key: "apiKey" },
+      },
+      {
+        name: t("setting.authorizationHeader"),
+        control: { type: "text", key: "authorizationHeaderName" },
+      },
+      {
+        name: t("setting.bindingHost"),
+        control: { type: "text", key: "bindingHost" },
+      },
+      {
+        name: t("setting.verboseLogging"),
+        desc: t("setting.verboseLoggingDesc"),
+        control: { type: "toggle", key: "enableVerboseLogging" },
+      },
+      {
+        name: t("setting.enableSignedUrls"),
+        desc: t("setting.enableSignedUrlsDesc"),
+        control: { type: "toggle", key: "enableSignedUrls" },
+      },
+      {
+        name: t("setting.signedUrlTtl"),
+        desc: t("setting.signedUrlTtlDesc", {
+          min: MinimumSignedUrlTtlSeconds,
+          max: MaximumSignedUrlTtlSeconds,
+          default: DefaultSignedUrlTtlSeconds,
+        }),
+        control: {
+          type: "number",
+          key: "signedUrlTtlSeconds",
+          min: MinimumSignedUrlTtlSeconds,
+          max: MaximumSignedUrlTtlSeconds,
+        },
+      },
+      {
+        name: t("setting.stateReadTimeout"),
+        desc: t("setting.stateReadTimeoutDesc", {
+          min: MinimumStateReadTimeoutMs,
+          max: MaximumStateReadTimeoutMs,
+          default: DefaultStateReadTimeoutMs,
+        }),
+        control: {
+          type: "number",
+          key: "stateReadTimeoutMs",
+          min: MinimumStateReadTimeoutMs,
+          max: MaximumStateReadTimeoutMs,
+        },
+      },
+      {
+        name: t("setting.configDirAccess"),
+        desc: t("setting.configDirAccessDesc", {
+          configDir: this.app.vault.configDir,
+        }),
+        control: { type: "toggle", key: "enableConfigDirAccess" },
+      },
+    ];
+  }
 
-    new Setting(containerEl)
-      .setName("Restore default settings")
-      .setDesc(
-        `Pressing this button will reset this plugin's
-        settings to defaults.
-        This settings panel will be closed when you press this.`
-      )
-      .addButton((cb) => {
-        cb.setWarning()
-          .setButtonText("Restore defaults")
-          .onClick(() => {
-            this.plugin.settings = Object.assign({}, DEFAULT_SETTINGS);
-            void this.plugin.saveSettings();
-            this.plugin.unload();
-            this.plugin.load();
+  private getCertificateSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        name: t("cert.status"),
+        render: (setting) => {
+          this.renderCertificateWarnings(this.prepareCustomContent(setting));
+        },
+      },
+      {
+        name: t("setting.regenerateCert"),
+        desc: t("setting.regenerateCertDesc"),
+        render: (setting) => {
+          setting.addButton((cb) => {
+            cb.setButtonText(t("setting.regenerateCertBtn"))
+              .setDestructive()
+              .onClick(() => {
+                delete this.plugin.settings.crypto;
+                void this.plugin.saveSettings();
+                this.plugin.unload();
+                this.plugin.load();
+              });
           });
-      });
+        },
+      },
+      {
+        name: t("setting.certificateHostnames"),
+        desc: t("setting.certificateHostnamesDesc"),
+        control: { type: "textarea", key: "subjectAltNames" },
+      },
+      {
+        name: t("advanced.caCert"),
+        desc: t("advanced.caCertDesc"),
+        control: { type: "textarea", key: "cryptoCaCert" },
+      },
+      {
+        name: t("advanced.caPrivateKey"),
+        desc: t("advanced.caPrivateKeyDesc"),
+        control: { type: "textarea", key: "cryptoCaPrivateKey" },
+      },
+      {
+        name: t("advanced.serverCert"),
+        desc: t("advanced.serverCertDesc"),
+        control: { type: "textarea", key: "cryptoCert" },
+      },
+      {
+        name: t("advanced.serverPublicKey"),
+        control: { type: "textarea", key: "cryptoPublicKey" },
+      },
+      {
+        name: t("advanced.serverPrivateKey"),
+        control: { type: "textarea", key: "cryptoPrivateKey" },
+      },
+    ];
+  }
 
-    new Setting(containerEl)
-      .setName("Show advanced settings")
-      .setDesc(
-        `Advanced settings are dangerous and may make your environment less secure.`
-      )
-      .addToggle((cb) => {
-        cb.onChange((value) => {
-          if (this.showAdvancedSettings !== value) {
-            this.showAdvancedSettings = value;
-            this.display();
-          }
-        }).setValue(this.showAdvancedSettings);
-      });
-
-    if (this.showAdvancedSettings) {
-      new Setting(containerEl).setHeading().setName("Advanced settings");
-      containerEl.createEl("p", {
-        text: `
-          The settings below are potentially dangerous and
-          are intended for use only by people who know what
-          they are doing. Do not change any of these settings if
-          you do not understand what that setting is used for
-          and what security impacts changing that setting will have.
-        `,
-      });
-      const noWarrantee = containerEl.createEl("p");
-      noWarrantee.createSpan({
-        text: `
-          Use of this software is licensed to you under the
-          MIT license, and it is important that you understand that
-          this license provides you with no warranty.
-          For the complete license text please see
-        `,
-      });
-      noWarrantee.createEl("a", {
-        href: LicenseUrl,
-        text: LicenseUrl,
-      });
-      noWarrantee.createSpan({ text: "." });
-
-      new Setting(containerEl)
-        .setName("Enable encrypted (HTTPS) server")
-        .setDesc(
-          "\n          This controls whether the HTTPS server is enabled.  You almost certainly want to leave this switch in its default state ('on'),\n          but may find it useful to turn this switch off for\n          troubleshooting.\n        "
-        )
-        .addToggle((cb) =>
-          cb
-            .onChange((value) => {
-              const originalValue = this.plugin.settings.enableSecureServer;
-              this.plugin.settings.enableSecureServer = value;
-              void this.plugin.saveSettings();
-              this.plugin.refreshServerState();
-              if (value !== originalValue) {
-                this.display();
-              }
-            })
-            .setValue(this.plugin.settings.enableSecureServer ?? true)
-        );
-
-      new Setting(containerEl)
-        .setName("Encrypted (HTTPS) server port")
-        .setDesc(
-          "This configures the port on which your REST API will listen for HTTPS connections.  It is recommended that you leave this port with its default setting as tools integrating with this API may expect the default port to be in use.  Under no circumstances is it recommended that you expose this service directly to the internet."
-        )
-        .addText((cb) =>
-          cb
-            .onChange((value) => {
-              this.plugin.settings.port = parseInt(value, 10);
-              void this.plugin.saveSettings();
-              this.plugin.refreshServerState();
-            })
-            .setValue(this.plugin.settings.port.toString())
-        );
-
-      new Setting(containerEl)
-        .setName("Non-encrypted (HTTP) server port")
-        .addText((cb) =>
-          cb
-            .onChange((value) => {
-              this.plugin.settings.insecurePort = parseInt(value, 10);
-              void this.plugin.saveSettings();
-              this.plugin.refreshServerState();
-            })
-            .setValue(this.plugin.settings.insecurePort.toString())
-        );
-
-      new Setting(containerEl).setName("API key").addText((cb) => {
-        cb.onChange((value) => {
-          this.plugin.settings.apiKey = value;
-          void this.plugin.saveSettings();
-          this.plugin.refreshServerState();
-        }).setValue(this.plugin.settings.apiKey ?? "");
-      });
-      new Setting(containerEl)
-        .setName("Certificate hostnames")
-        .setDesc(
-          `
-          List of extra hostnames to add
-          to your certificate's \`subjectAltName\` field.
-          One hostname per line.
-          You must click the "Re-generate Certificates" button above after changing this value
-          for this to have an effect.  This is useful for
-          situations in which you are accessing Obsidian
-          from a hostname other than the host on which
-          it is running.
-      `
-        )
-        .addTextArea((cb) =>
-          cb
-            .onChange((value) => {
-              this.plugin.settings.subjectAltNames = value;
-              void this.plugin.saveSettings();
-            })
-            .setValue(this.plugin.settings.subjectAltNames ?? "")
-        );
-      new Setting(containerEl).setName("Certificate").addTextArea((cb) =>
-        cb
-          .onChange((value) => {
-            this.plugin.settings.crypto.cert = value;
-            void this.plugin.saveSettings();
-            this.plugin.refreshServerState();
-          })
-          .setValue(this.plugin.settings.crypto.cert)
-      );
-      new Setting(containerEl).setName("Public key").addTextArea((cb) =>
-        cb
-          .onChange((value) => {
-            this.plugin.settings.crypto.publicKey = value;
-            void this.plugin.saveSettings();
-            this.plugin.refreshServerState();
-          })
-          .setValue(this.plugin.settings.crypto.publicKey)
-      );
-      new Setting(containerEl).setName("Private key").addTextArea((cb) =>
-        cb
-          .onChange((value) => {
-            this.plugin.settings.crypto.privateKey = value;
-            void this.plugin.saveSettings();
-            this.plugin.refreshServerState();
-          })
-          .setValue(this.plugin.settings.crypto.privateKey)
-      );
-      new Setting(containerEl).setName("Authorization header").addText((cb) => {
-        cb.onChange((value) => {
-          if (value !== DefaultBearerTokenHeaderName) {
-            this.plugin.settings.authorizationHeaderName = value;
-          } else {
-            delete this.plugin.settings.authorizationHeaderName;
-          }
-          void this.plugin.saveSettings();
-          this.plugin.refreshServerState();
-        }).setValue(
+  getControlValue(key: string): unknown {
+    switch (key) {
+      case "enableInsecureServer":
+        return this.plugin.settings.enableInsecureServer;
+      case "enableSecureServer":
+        return this.plugin.settings.enableSecureServer ?? true;
+      case "port":
+        return this.plugin.settings.port;
+      case "insecurePort":
+        return this.plugin.settings.insecurePort;
+      case "apiKey":
+        return this.plugin.settings.apiKey ?? "";
+      case "subjectAltNames":
+        return this.plugin.settings.subjectAltNames ?? "";
+      case "cryptoCert":
+        return this.plugin.settings.crypto?.cert ?? "";
+      case "cryptoPublicKey":
+        return this.plugin.settings.crypto?.publicKey ?? "";
+      case "cryptoPrivateKey":
+        return this.plugin.settings.crypto?.privateKey ?? "";
+      case "cryptoCaCert":
+        return this.plugin.settings.crypto?.caCert ?? "";
+      case "cryptoCaPrivateKey":
+        return this.plugin.settings.crypto?.caPrivateKey ?? "";
+      case "authorizationHeaderName":
+        return (
           this.plugin.settings.authorizationHeaderName ??
-            DefaultBearerTokenHeaderName
+          DefaultBearerTokenHeaderName
         );
-      });
-      new Setting(containerEl).setName("Binding host").addText((cb) => {
-        cb.onChange((value) => {
-          if (value !== DefaultBindingHost) {
-            this.plugin.settings.bindingHost = value;
-          } else {
-            delete this.plugin.settings.bindingHost;
-          }
-          void this.plugin.saveSettings();
+      case "bindingHost":
+        return this.plugin.settings.bindingHost ?? DefaultBindingHost;
+      case "enableVerboseLogging":
+        return this.plugin.settings.enableVerboseLogging ?? false;
+      case "enableSignedUrls":
+        return this.plugin.settings.enableSignedUrls ?? true;
+      case "enableConfigDirAccess":
+        return this.plugin.settings.enableConfigDirAccess ?? false;
+      case "signedUrlTtlSeconds":
+        return clampSignedUrlTtl(this.plugin.settings.signedUrlTtlSeconds);
+      case "stateReadTimeoutMs":
+        return clampStateReadTimeout(this.plugin.settings.stateReadTimeoutMs);
+      default:
+        return undefined;
+    }
+  }
+
+  async setControlValue(key: string, value: unknown): Promise<void> {
+    switch (key) {
+      case "enableInsecureServer":
+        this.plugin.settings.enableInsecureServer = value as boolean;
+        await this.plugin.saveSettings();
+        this.plugin.refreshServerState();
+        break;
+      case "enableSecureServer":
+        this.plugin.settings.enableSecureServer = value as boolean;
+        await this.plugin.saveSettings();
+        this.plugin.refreshServerState();
+        break;
+      case "port":
+        this.plugin.settings.port = value as number;
+        await this.plugin.saveSettings();
+        this.plugin.refreshServerState();
+        break;
+      case "insecurePort":
+        this.plugin.settings.insecurePort = value as number;
+        await this.plugin.saveSettings();
+        this.plugin.refreshServerState();
+        break;
+      case "apiKey":
+        this.plugin.settings.apiKey = value as string;
+        await this.plugin.saveSettings();
+        this.plugin.refreshServerState();
+        break;
+      case "subjectAltNames":
+        this.plugin.settings.subjectAltNames = value as string;
+        await this.plugin.saveSettings();
+        break;
+      case "cryptoCert":
+        if (this.plugin.settings.crypto) {
+          this.plugin.settings.crypto.cert = value as string;
+          await this.plugin.saveSettings();
           this.plugin.refreshServerState();
-        }).setValue(this.plugin.settings.bindingHost ?? DefaultBindingHost);
-      });
-      new Setting(containerEl)
-        .setName("Enable verbose logging")
-        .setDesc(
-          "When enabled, logs server startup messages and a one-line access log entry for every request to the browser console."
-        )
-        .addToggle((cb) =>
-          cb
-            .onChange((value) => {
-              this.plugin.settings.enableVerboseLogging = value || undefined;
-              void this.plugin.saveSettings();
-            })
-            .setValue(this.plugin.settings.enableVerboseLogging ?? false)
-        );
+        }
+        break;
+      case "cryptoPublicKey":
+        if (this.plugin.settings.crypto) {
+          this.plugin.settings.crypto.publicKey = value as string;
+          await this.plugin.saveSettings();
+          this.plugin.refreshServerState();
+        }
+        break;
+      case "cryptoPrivateKey":
+        if (this.plugin.settings.crypto) {
+          this.plugin.settings.crypto.privateKey = value as string;
+          await this.plugin.saveSettings();
+          this.plugin.refreshServerState();
+        }
+        break;
+      case "cryptoCaCert":
+      case "cryptoCaPrivateKey": {
+        // An empty CA field means "none", not an empty PEM: self-signed
+        // material must not carry an empty string that later fails to parse.
+        const field = key === "cryptoCaCert" ? "caCert" : "caPrivateKey";
+        if (this.plugin.settings.crypto) {
+          const text = (value as string).trim();
+          if (text) {
+            this.plugin.settings.crypto[field] = text;
+          } else {
+            delete this.plugin.settings.crypto[field];
+          }
+          await this.plugin.saveSettings();
+          this.plugin.refreshServerState();
+        }
+        break;
+      }
+      case "authorizationHeaderName":
+        if (value !== DefaultBearerTokenHeaderName) {
+          this.plugin.settings.authorizationHeaderName = value as string;
+        } else {
+          delete this.plugin.settings.authorizationHeaderName;
+        }
+        await this.plugin.saveSettings();
+        this.plugin.refreshServerState();
+        break;
+      case "bindingHost":
+        if (value !== DefaultBindingHost) {
+          this.plugin.settings.bindingHost = value as string;
+        } else {
+          delete this.plugin.settings.bindingHost;
+        }
+        await this.plugin.saveSettings();
+        this.plugin.refreshServerState();
+        break;
+      case "enableVerboseLogging":
+        this.plugin.settings.enableVerboseLogging = (value as boolean) || undefined;
+        await this.plugin.saveSettings();
+        break;
+      case "enableConfigDirAccess":
+        // Stored only when on: the default is off, so an absent key means off and the
+        // REST and MCP layers read it as false. Both read the setting live, so no
+        // server restart is needed.
+        this.plugin.settings.enableConfigDirAccess = (value as boolean) || undefined;
+        await this.plugin.saveSettings();
+        break;
+      case "enableSignedUrls":
+        // Stored both ways: the default is on, so an absent key means on and only an
+        // explicit false turns it off.
+        this.plugin.settings.enableSignedUrls = value as boolean;
+        await this.plugin.saveSettings();
+        // The REST side reads the setting per request; the MCP side registers or
+        // removes its signed-URL tools to match, so connected clients see the change.
+        this.plugin.requestHandler.mcpHandler.setSignedUrlsEnabled(value as boolean);
+        break;
+      case "signedUrlTtlSeconds": {
+        const clamped = clampSignedUrlTtl(value as number);
+        this.plugin.settings.signedUrlTtlSeconds =
+          clamped === DefaultSignedUrlTtlSeconds ? undefined : clamped;
+        await this.plugin.saveSettings();
+        break;
+      }
+      case "stateReadTimeoutMs": {
+        // Read per request by GET /, so no server restart is needed.
+        const clamped = clampStateReadTimeout(value as number);
+        this.plugin.settings.stateReadTimeoutMs =
+          clamped === DefaultStateReadTimeoutMs ? undefined : clamped;
+        await this.plugin.saveSettings();
+        break;
+      }
     }
   }
 }
-
-export const getAPI = (
-  app: App,
-  manifest: PluginManifest,
-  version?: number,
-): LocalRestApiPublicApi | undefined => {
-  const plugin = app.plugins.plugins["obsidian-local-rest-api"];
-  if (!plugin) return undefined;
-  const api = (plugin as unknown as LocalRestApi).getPublicApi(manifest);
-  if (version !== undefined) {
-    const availableVersion = api.apiVersion ?? 1;
-    if (availableVersion < version) {
-      throw new ApiVersionUnsupportedError(version, availableVersion);
-    }
-  }
-  return api;
-};

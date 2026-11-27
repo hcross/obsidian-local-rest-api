@@ -1,0 +1,1402 @@
+import fs from "fs";
+import path from "path";
+import {
+  App,
+  CachedMetadata,
+  FileSystemAdapter,
+  TFile,
+  _prepareSimpleSearchMock,
+} from "../mocks/obsidian";
+import { fakeReadlink, fakeRealpath } from "../mocks/disk";
+import { declaredEvents } from "../mocks/obsidianTypings";
+import { ConfigDirAccessError } from "./vaultPath";
+import {
+  BACKLINKS_INDEX_MAX_AGE_MS,
+  METADATA_CACHE_EVENTS,
+  VAULT_EVENTS,
+  VaultOperations,
+} from "./vaultOperations";
+import { LocalRestApiSettings } from "./types";
+import { versionOf } from "markdown-patch-2";
+import { parseEntityTagCondition, PreconditionFailedError } from "./conditionalRequests";
+
+// ---------------------------------------------------------------------------
+// Writes must go through the Vault API, not the adapter.
+//
+// Vault.adapter.write puts bytes on disk behind Obsidian's back, leaving metadataCache
+// describing the previous revision until the file watcher catches up. Since
+// getFileMetadataObject serves frontmatter and tags from that cache, a client that
+// wrote and immediately read back could be handed pre-write metadata. Vault.modify
+// keeps Obsidian's bookkeeping in step with the write instead.
+// ---------------------------------------------------------------------------
+
+const MD_PATH = "note.md";
+
+function setup(existingContent: string, fileExists = true): {
+  app: App;
+  ops: VaultOperations;
+} {
+  const app = new App();
+  if (fileExists) {
+    const file = new TFile();
+    file.path = MD_PATH;
+    app.vault._getAbstractFileByPath = file;
+  } else {
+    app.vault._getAbstractFileByPath = null;
+  }
+  app.vault._read = existingContent;
+  app.vault.adapter._read = existingContent;
+  const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+  return { app, ops };
+}
+
+describe("writes go through the Vault API", () => {
+  test("patchFileSectionMdp2 modifies through the vault", async () => {
+    const { app, ops } = setup("---\ntitle: Probe\n---\n\n# Hi\n");
+
+    await ops.patchFileSectionMdp2(MD_PATH, {
+      targetType: "frontmatter",
+      target: "related",
+      operation: "replace",
+      value: ["alpha", "beta"],
+      createTargetIfMissing: true,
+    });
+
+    expect(app.vault._modify?.[0]).toBe(MD_PATH);
+    expect(app.vault._modify?.[1]).toContain("related");
+  });
+
+  test("appendFileContent modifies an existing file through the vault", async () => {
+    const { app, ops } = setup("original\n");
+    await ops.appendFileContent(MD_PATH, "appended\n");
+    expect(app.vault._modify).toEqual([MD_PATH, "original\nappended\n"]);
+  });
+
+  test("appendFileContent creates a missing file through the vault", async () => {
+    const { app, ops } = setup("", false);
+    await ops.appendFileContent(MD_PATH, "appended\n");
+    expect(app.vault._create).toEqual([MD_PATH, "appended\n"]);
+  });
+
+  test("writeFileContent modifies an existing file through the vault", async () => {
+    const { app, ops } = setup("original\n");
+    await ops.writeFileContent(MD_PATH, "replacement\n");
+    expect(app.vault._modify).toEqual([MD_PATH, "replacement\n"]);
+  });
+
+  test("writeFileContent creates a missing file through the vault", async () => {
+    const { app, ops } = setup("", false);
+    await ops.writeFileContent(MD_PATH, "brand new\n");
+    expect(app.vault._create).toEqual([MD_PATH, "brand new\n"]);
+  });
+
+  test("binary writes still go through the adapter", async () => {
+    // Vault.modify is text-only, so binary uploads keep using writeBinary.
+    const { app, ops } = setup("");
+    await ops.writeFileContent("image.png", Buffer.from([1, 2, 3]));
+    expect(app.vault.adapter._writeBinary?.[0]).toBe("image.png");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Conditional writes.
+//
+// Every mutating operation takes optional If-Match/If-None-Match preconditions,
+// checked against a hash of the file's bytes immediately before the write, with
+// the check and the write held under a per-path queue so another API write
+// cannot land between them.
+// ---------------------------------------------------------------------------
+
+/** A vault whose single file's text, bytes and existence all follow every write,
+ *  so a second operation sees what the first one wrote. */
+function setupLiveFile(initial: string | null): { app: App; ops: VaultOperations } {
+  const { app, ops } = setup(initial ?? "", initial !== null);
+  const store = (text: string | null): void => {
+    app.vault._read = text ?? "";
+    app.vault.adapter._read = text ?? "";
+    app.vault.adapter._exists = text !== null;
+    const bytes = Buffer.from(text ?? "", "utf8");
+    app.vault.adapter._readBinary = bytes.buffer.slice(
+      bytes.byteOffset,
+      bytes.byteOffset + bytes.byteLength,
+    );
+    if (text === null) {
+      app.vault._getAbstractFileByPath = null;
+    } else {
+      const file = new TFile();
+      file.path = MD_PATH;
+      app.vault._getAbstractFileByPath = file;
+    }
+  };
+  store(initial);
+  const originalModify = app.vault.modify.bind(app.vault);
+  app.vault.modify = async (file: TFile, content: string): Promise<void> => {
+    // Yield first, as a real disk write would, so an unserialized second
+    // operation gets the chance to read the old bytes in between.
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await originalModify(file, content);
+    store(content);
+  };
+  const originalCreate = app.vault.create.bind(app.vault);
+  app.vault.create = async (filePath: string, content: string): Promise<TFile> => {
+    const created = await originalCreate(filePath, content);
+    store(content);
+    return created;
+  };
+  return { app, ops };
+}
+
+function ifMatch(raw: string) {
+  const condition = parseEntityTagCondition(raw);
+  if (condition === null) throw new Error(`unparseable test condition ${raw}`);
+  return { ifMatch: condition };
+}
+
+describe("conditional writes", () => {
+  const ORIGINAL = "original\n";
+  const ORIGINAL_VERSION = versionOf(ORIGINAL);
+
+  test("getFileState hashes the file's bytes with markdown-patch's versionOf", async () => {
+    const { ops } = setupLiveFile(ORIGINAL);
+    await expect(ops.getFileState(MD_PATH)).resolves.toEqual({
+      exists: true,
+      version: ORIGINAL_VERSION,
+    });
+  });
+
+  test("getFileState reports a missing file and a folder without a version", async () => {
+    const missing = setupLiveFile(null);
+    await expect(missing.ops.getFileState(MD_PATH)).resolves.toEqual({
+      exists: false,
+      version: null,
+    });
+    const folder = setupLiveFile(ORIGINAL);
+    folder.app.vault.adapter._stat.type = "folder";
+    await expect(folder.ops.getFileState("dir")).resolves.toEqual({
+      exists: true,
+      version: null,
+    });
+  });
+
+  test("the version matches the document map's", async () => {
+    const { app, ops } = setupLiveFile("# Title\n\nBody\n");
+    const file = app.vault._getAbstractFileByPath;
+    if (!(file instanceof TFile)) throw new Error("expected the test file to exist");
+    const map = await ops.getDocumentMapV2Object(file);
+    expect((await ops.getFileState(MD_PATH)).version).toBe(map.version);
+  });
+
+  test("writeFileContent with a matching If-Match writes and returns the new version", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    const version = await ops.writeFileContent(
+      MD_PATH,
+      "replacement\n",
+      ifMatch(`"${ORIGINAL_VERSION}"`),
+    );
+    expect(app.vault._modify).toEqual([MD_PATH, "replacement\n"]);
+    expect(version).toBe(versionOf("replacement\n"));
+  });
+
+  test("writeFileContent with a stale If-Match throws and writes nothing", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    await expect(
+      ops.writeFileContent(MD_PATH, "replacement\n", ifMatch('"000000"')),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    expect(app.vault._modify).toBeUndefined();
+    expect(app.vault._create).toBeUndefined();
+  });
+
+  test("writeFileContent with If-Match on a missing file throws instead of creating it", async () => {
+    const { app, ops } = setupLiveFile(null);
+    await expect(
+      ops.writeFileContent(MD_PATH, "new\n", ifMatch(ORIGINAL_VERSION)),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    expect(app.vault._create).toBeUndefined();
+  });
+
+  test("writeFileContent with If-None-Match: * creates a missing file and refuses an existing one", async () => {
+    const created = setupLiveFile(null);
+    await created.ops.writeFileContent(MD_PATH, "new\n", { ifNoneMatch: "*" });
+    expect(created.app.vault._create).toEqual([MD_PATH, "new\n"]);
+
+    const existing = setupLiveFile(ORIGINAL);
+    await expect(
+      existing.ops.writeFileContent(MD_PATH, "new\n", { ifNoneMatch: "*" }),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    expect(existing.app.vault._modify).toBeUndefined();
+  });
+
+  test("a binary write returns the version of its bytes", async () => {
+    const { ops } = setupLiveFile(null);
+    const bytes = Buffer.from([0, 159, 146, 150]);
+    await expect(ops.writeFileContent("image.png", bytes)).resolves.toBe(versionOf(bytes));
+  });
+
+  test("appendFileContent checks the precondition and returns the resulting version", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    const version = await ops.appendFileContent(MD_PATH, "more\n", ifMatch(ORIGINAL_VERSION));
+    expect(app.vault._modify).toEqual([MD_PATH, "original\nmore\n"]);
+    expect(version).toBe(versionOf("original\nmore\n"));
+
+    await expect(
+      ops.appendFileContent(MD_PATH, "again\n", ifMatch(ORIGINAL_VERSION)),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+  });
+
+  test("deleteVaultFile checks the precondition before trashing", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    await expect(
+      ops.deleteVaultFile(MD_PATH, false, ifMatch('"000000"')),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    expect(app.fileManager._trashFile).toBeUndefined();
+
+    await ops.deleteVaultFile(MD_PATH, false, ifMatch(ORIGINAL_VERSION));
+    expect(app.fileManager._trashFile?.path).toBe(MD_PATH);
+  });
+
+  test("moveVaultFile and copyVaultFile check the precondition against the source", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    // The destination does not exist; the source (the only file) does.
+    app.vault.adapter.exists = async (p: string) => p === MD_PATH;
+    await expect(
+      ops.moveVaultFile(MD_PATH, "moved.md", false, ifMatch('"000000"')),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    await expect(
+      ops.copyVaultFile(MD_PATH, "copied.md", false, ifMatch('"000000"')),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+  });
+
+  test("patchFileSectionMdp2 checks header preconditions as well as the instruction's ifMatch", async () => {
+    const { app, ops } = setupLiveFile("# A\n\nbody\n");
+    await expect(
+      ops.patchFileSectionMdp2(
+        MD_PATH,
+        { targetType: "heading", target: ["A"], operation: "append", content: "x\n" },
+        ifMatch('"000000"'),
+      ),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    expect(app.vault._modify).toBeUndefined();
+  });
+
+  test("patchFileSection (1.x) checks header preconditions", async () => {
+    const { app, ops } = setupLiveFile("# A\n\nbody\n");
+    await expect(
+      ops.patchFileSection(
+        MD_PATH, "heading", "A", "append", "x\n", "text/markdown", undefined,
+        ifMatch('"000000"'),
+      ),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    expect(app.vault._modify).toBeUndefined();
+  });
+
+  test("two writes racing on the same If-Match: exactly one wins", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    const results = await Promise.allSettled([
+      ops.writeFileContent(MD_PATH, "first\n", ifMatch(ORIGINAL_VERSION)),
+      ops.writeFileContent(MD_PATH, "second\n", ifMatch(ORIGINAL_VERSION)),
+    ]);
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
+    const rejected = results[1] as PromiseRejectedResult;
+    expect(rejected.reason).toBeInstanceOf(PreconditionFailedError);
+    expect(app.vault._read).toBe("first\n");
+  });
+
+  test("an unconditional write cannot slip between a conditional write's check and its write", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    const conditional = ops.writeFileContent(MD_PATH, "conditional\n", ifMatch(ORIGINAL_VERSION));
+    const unconditional = ops.writeFileContent(MD_PATH, "unconditional\n");
+    await Promise.all([conditional, unconditional]);
+    // Queued in call order: the conditional write saw the original, then the
+    // unconditional one replaced it. Neither write was lost to the other.
+    expect(app.vault._read).toBe("unconditional\n");
+  });
+
+  test("a failed write releases the path for the next one", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    await expect(
+      ops.writeFileContent(MD_PATH, "nope\n", ifMatch('"000000"')),
+    ).rejects.toBeInstanceOf(PreconditionFailedError);
+    await ops.writeFileContent(MD_PATH, "next\n");
+    expect(app.vault._read).toBe("next\n");
+  });
+
+  test("writes to different paths are not serialized behind each other", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>((resolve) => {
+      releaseSlow = resolve;
+    });
+    const order: string[] = [];
+    app.vault.adapter.writeBinary = async (p: string): Promise<void> => {
+      if (p === "slow.bin") await slowGate;
+      order.push(p);
+    };
+    const slow = ops.writeFileContent("slow.bin", Buffer.from([1]));
+    await ops.writeFileContent("fast.bin", Buffer.from([2]));
+    expect(order).toEqual(["fast.bin"]);
+    releaseSlow();
+    await slow;
+    expect(order).toEqual(["fast.bin", "slow.bin"]);
+  });
+
+  test("getFileMetadataObject carries the version of the content it returns", async () => {
+    const { app, ops } = setupLiveFile(ORIGINAL);
+    const file = app.vault._getAbstractFileByPath;
+    if (!(file instanceof TFile)) throw new Error("expected the test file to exist");
+    const withContent = await ops.getFileMetadataObject(file, undefined, true, ORIGINAL);
+    expect(withContent.version).toBe(ORIGINAL_VERSION);
+    const withoutContent = await ops.getFileMetadataObject(file, undefined, false);
+    expect(withoutContent).not.toHaveProperty("version");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Content the caller has already read replaces the read these methods would do.
+//
+// MCP's vault_read reads a file's raw bytes so that it can refuse one whose bytes are
+// not valid UTF-8, and then needs exactly the text these two methods would otherwise
+// fetch for themselves. Passing it in is what keeps that guard to a single read of the
+// file; a caller that omits it reads as it always did.
+// ---------------------------------------------------------------------------
+
+describe("supplied content stands in for a second read", () => {
+  function withFile(existingContent: string): {
+    app: App;
+    ops: VaultOperations;
+    file: TFile;
+  } {
+    const { app, ops } = setup(existingContent);
+    const file = new TFile();
+    file.path = MD_PATH;
+    app.vault._getAbstractFileByPath = file;
+    return { app, ops, file };
+  }
+
+  test("readFileSectionMdp2 reads the supplied text, not the file", async () => {
+    const { app, ops, file } = withFile("# Alpha\n\nfrom disk\n");
+    const read = jest.spyOn(app.vault.adapter, "read");
+
+    const result = await ops.readFileSectionMdp2(
+      file,
+      { targetType: "heading", target: ["Alpha"] },
+      "# Alpha\n\nsupplied\n",
+    );
+
+    expect(JSON.stringify(result)).toContain("supplied");
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  test("readFileSectionMdp2 reads the file when no text is supplied", async () => {
+    const { ops, file } = withFile("# Alpha\n\nfrom disk\n");
+
+    const result = await ops.readFileSectionMdp2(file, {
+      targetType: "heading",
+      target: ["Alpha"],
+    });
+
+    expect(JSON.stringify(result)).toContain("from disk");
+  });
+
+  test("getFileMetadataObject returns the supplied text without a cachedRead", async () => {
+    const { app, ops, file } = withFile("");
+    app.vault._cachedRead = "from disk";
+    const cachedRead = jest.spyOn(app.vault, "cachedRead");
+
+    const meta = await ops.getFileMetadataObject(file, undefined, true, "supplied");
+
+    expect(meta.content).toBe("supplied");
+    expect(cachedRead).not.toHaveBeenCalled();
+  });
+
+  test("getFileMetadataObject falls back to cachedRead when no text is supplied", async () => {
+    const { app, ops, file } = withFile("");
+    app.vault._cachedRead = "from disk";
+
+    expect((await ops.getFileMetadataObject(file)).content).toBe("from disk");
+  });
+
+  // includeContent is the caller saying it does not want the body at all — a bulk search
+  // result, say — and that answer does not change because content happens to be at hand.
+  test("getFileMetadataObject still omits content when includeContent is false", async () => {
+    const { ops, file } = withFile("");
+
+    const meta = await ops.getFileMetadataObject(file, undefined, false, "supplied");
+
+    expect(meta.content).toBe("");
+  });
+});
+
+describe("readBinaryFileContent", () => {
+  test("returns the adapter's bytes rather than a decoded string", async () => {
+    const { app, ops } = setup("");
+    // 0x89 leads a PNG and is not valid UTF-8, so a decoded read could not produce it.
+    const bytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47]);
+    app.vault.adapter._readBinary = bytes.buffer;
+
+    const read = await ops.readBinaryFileContent(MD_PATH);
+
+    expect(new Uint8Array(read)).toEqual(bytes);
+  });
+
+  test("throws for a path that is not a file, matching the text read", async () => {
+    const { ops } = setup("", false);
+    await expect(ops.readBinaryFileContent(MD_PATH)).rejects.toThrow(
+      `File not found: ${MD_PATH}`,
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// simpleSearch limits.
+//
+// Obsidian's simple search matches each query word separately, so a query that
+// contains a common word matches thousands of times across a vault. maxResults
+// and maxMatchesPerFile bound what comes back; totalResults and totalMatches say
+// how much was left out.
+// ---------------------------------------------------------------------------
+
+describe("simpleSearch limits", () => {
+  // Every occurrence of the query in "<basename>\n\n<content>" is a match, and a
+  // file scores one point per match, so a basename that repeats the query ranks
+  // higher. The mock vault serves the same content for every file.
+  function limitSetup(basenames: string[], content: string): VaultOperations {
+    const app = new App();
+    app.vault._markdownFiles = basenames.map((basename) => {
+      const file = new TFile();
+      file.basename = basename;
+      file.path = `${basename}.md`;
+      return file;
+    });
+    app.vault._cachedRead = content;
+    _prepareSimpleSearchMock.behavior = (query: string) => (text: string) => {
+      const matches: [number, number][] = [];
+      for (let i = text.indexOf(query); i !== -1; i = text.indexOf(query, i + 1)) {
+        matches.push([i, i + query.length]);
+      }
+      return matches.length ? { score: matches.length, matches } : null;
+    };
+    return new VaultOperations(app, {} as LocalRestApiSettings);
+  }
+
+  afterEach(() => {
+    _prepareSimpleSearchMock.behavior = null;
+  });
+
+  test("returns everything, with totals, when no limits are given", async () => {
+    const ops = limitSetup(["a", "b"], "the the the");
+    const { results, totalResults } = await ops.simpleSearch("the");
+
+    expect(totalResults).toBe(2);
+    expect(results).toHaveLength(2);
+    for (const result of results) {
+      expect(result.matches).toHaveLength(3);
+      expect(result.totalMatches).toBe(3);
+    }
+  });
+
+  test("maxMatchesPerFile keeps the first matches in document order", async () => {
+    const ops = limitSetup(["the note"], "the the the");
+    const { results } = await ops.simpleSearch("the", { maxMatchesPerFile: 2 });
+
+    expect(results[0].totalMatches).toBe(4);
+    expect(results[0].matches.map((m) => [m.match.source, m.match.start])).toEqual([
+      ["filename", 0],
+      ["content", 0],
+    ]);
+  });
+
+  test("maxResults keeps the highest-scoring files", async () => {
+    const ops = limitSetup(["the", "the the the", "the the"], "x");
+    const { results, totalResults } = await ops.simpleSearch("the", { maxResults: 2 });
+
+    expect(totalResults).toBe(3);
+    expect(results.map((r) => r.filename)).toEqual(["the the the.md", "the the.md"]);
+  });
+
+  test("limits larger than the result leave it whole", async () => {
+    const ops = limitSetup(["a"], "the the");
+    const { results, totalResults } = await ops.simpleSearch("the", {
+      maxResults: 10,
+      maxMatchesPerFile: 10,
+    });
+
+    expect(totalResults).toBe(1);
+    expect(results[0].matches).toHaveLength(2);
+    expect(results[0].totalMatches).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// simpleSearch context slicing must not split UTF-16 surrogate pairs.
+//
+// Obsidian's prepareSimpleSearch reports matches as UTF-16 code-unit offsets,
+// and the context window is produced with String.prototype.slice, which also
+// works in code units. When a contextLength boundary lands between the two
+// halves of a surrogate pair (e.g. the emoji 🔌 = U+D83D U+DD0C), the returned
+// context can contain an unpaired surrogate. See
+// https://github.com/coddingtonbear/obsidian-local-rest-api/issues/330.
+// ---------------------------------------------------------------------------
+
+describe("simpleSearch surrogate handling", () => {
+  function searchSetup(content: string, contextLength: number): {
+    ops: VaultOperations;
+    results: () => Promise<{ context: string }[]>;
+  } {
+    const query = "needle";
+    const file = new TFile();
+    file.basename = "note";
+    file.path = "note.md";
+
+    const app = new App();
+    app.vault._markdownFiles = [file];
+    app.vault._cachedRead = content;
+    // "note\n\n" is prepended as the filename prefix, so the first 6 code units
+    // are the prefix; the content starts at offset 6.
+    _prepareSimpleSearchMock.behavior = (query: string) => {
+      const queryLength = query.length;
+      return (text: string) => {
+        const index = text.indexOf(query, 6);
+        if (index === -1) return null;
+        return {
+          score: 1,
+          matches: [[index, index + queryLength]],
+        };
+      };
+    };
+
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    return {
+      ops,
+      results: async () =>
+        (await ops.simpleSearch(query, { contextLength })).results.flatMap((r) =>
+          r.matches.map((m) => ({ context: m.context })),
+        ),
+    };
+  }
+
+  afterEach(() => {
+    _prepareSimpleSearchMock.behavior = null;
+  });
+
+  test("start boundary splits a surrogate pair (issue #330 repro)", async () => {
+    // 🔌 (U+D83D U+DD0C) precedes the match; a contextLength of 2 slices from
+    // code-unit 1, between the two surrogate halves.
+    const { results } = searchSetup("🔌xneedle", 2);
+    expect(await results()).toEqual([{ context: "🔌xneedle" }]);
+  });
+
+  test("end boundary splits a surrogate pair", async () => {
+    // The match ends at code-unit 7; a contextLength of 1 slices up to code-unit
+    // 8, which sits between the surrogate halves of the trailing 🔌.
+    const { results } = searchSetup("xneedle🔌", 1);
+    expect(await results()).toEqual([{ context: "xneedle🔌" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A single-note read must not rescan the whole vault link graph.
+//
+// buildBacklinksIndex walks every entry of metadataCache.resolvedLinks and every
+// target within it -- the entire vault link graph -- to answer "which files link
+// here". The bulk search path builds it once and threads it through its loop, but
+// every single-note metadata read (GET /vault/<path> as note+json, and the MCP
+// vault_read tool) used to pay for a fresh whole-graph scan and then discard all
+// but one entry of the result.
+//
+// Caching it makes correctness the interesting question rather than cost: a
+// cached graph that outlives a change to the real one serves stale backlinks.
+//
+// Two things hold that down, and both are tested here. The cache is dropped on
+// every event Obsidian's metadata cache and vault declare -- not the subset that
+// looked relevant, so there is no judgement call to get wrong -- and it ages out
+// regardless, so an announcement that never arrives costs a bounded window of
+// staleness rather than a permanently wrong answer.
+// ---------------------------------------------------------------------------
+
+describe("backlinks index caching", () => {
+  function backlinksSetup(): {
+    app: App;
+    ops: VaultOperations;
+    file: TFile;
+    build: jest.SpyInstance;
+    backlinks: () => Promise<string[]>;
+  } {
+    const app = new App();
+    const file = new TFile();
+    file.path = "note.md";
+    app.vault._getAbstractFileByPath = file;
+    app.metadataCache.resolvedLinks = { "a.md": { "note.md": 1 } };
+
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    const build = jest.spyOn(ops, "buildBacklinksIndex");
+
+    return {
+      app,
+      ops,
+      file,
+      build,
+      backlinks: async () => (await ops.getFileMetadataObject(file)).backlinks,
+    };
+  }
+
+  test("repeated single-note reads scan the link graph once", async () => {
+    const { build, backlinks } = backlinksSetup();
+
+    expect(await backlinks()).toEqual(["a.md"]);
+    expect(await backlinks()).toEqual(["a.md"]);
+    expect(await backlinks()).toEqual(["a.md"]);
+
+    expect(build).toHaveBeenCalledTimes(1);
+  });
+
+  // Every event either emitter declares, whether or not it is one that plausibly
+  // moves the link graph. Deciding which ones matter is exactly the judgement
+  // this cache should not be resting on, and an invalidation too many only costs
+  // a rebuild the uncached code performed on every single read.
+  test.each([
+    // Fired when a file has been indexed and its cache is available.
+    [
+      "metadataCache changed",
+      (app: App) => app.metadataCache._emit("changed", new TFile(), "", null),
+    ],
+    // A deleted file drops out of the graph, along with the links it made.
+    [
+      "metadataCache deleted",
+      (app: App) => app.metadataCache._emit("deleted", new TFile(), null),
+    ],
+    // Fired for each file whose links have been re-resolved.
+    [
+      "metadataCache resolve",
+      (app: App) => app.metadataCache._emit("resolve", new TFile()),
+    ],
+    // Fired once after a batch of re-resolutions completes.
+    [
+      "metadataCache resolved",
+      (app: App) => app.metadataCache._emit("resolved"),
+    ],
+    ["vault create", (app: App) => app.vault._emit("create", new TFile())],
+    ["vault modify", (app: App) => app.vault._emit("modify", new TFile())],
+    ["vault delete", (app: App) => app.vault._emit("delete", new TFile())],
+    // resolvedLinks is keyed by path, so a rename re-keys it -- and Obsidian
+    // documents that renames deliberately do not fire the cache's own events.
+    [
+      "vault rename",
+      (app: App) => app.vault._emit("rename", new TFile(), "old.md"),
+    ],
+  ])("%s invalidates the cached index", async (_name, fire) => {
+    const { app, build, backlinks } = backlinksSetup();
+
+    expect(await backlinks()).toEqual(["a.md"]);
+
+    app.metadataCache.resolvedLinks = {
+      "a.md": { "note.md": 1 },
+      "b.md": { "note.md": 1 },
+    };
+    fire(app);
+
+    expect(await backlinks()).toEqual(["a.md", "b.md"]);
+    expect(build).toHaveBeenCalledTimes(2);
+  });
+
+  test("the index ages out even when nothing announces the change", async () => {
+    // The listener list covers every event Obsidian declares today, but this
+    // cache's correctness must not rest on that list still being complete after
+    // an Obsidian upgrade. An event nobody here has heard of, or an internal
+    // path that rewrites resolvedLinks without announcing anything, would
+    // otherwise leave a stale index in place for the lifetime of the plugin.
+    // Ageing it out bounds that at BACKLINKS_INDEX_MAX_AGE_MS instead.
+    jest.useFakeTimers();
+    try {
+      const { app, build, backlinks } = backlinksSetup();
+
+      expect(await backlinks()).toEqual(["a.md"]);
+
+      app.metadataCache.resolvedLinks = {
+        "a.md": { "note.md": 1 },
+        "b.md": { "note.md": 1 },
+      };
+      // Deliberately no event: this is the case the listeners cannot cover.
+      jest.advanceTimersByTime(BACKLINKS_INDEX_MAX_AGE_MS);
+
+      expect(await backlinks()).toEqual(["a.md", "b.md"]);
+      expect(build).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("the index is still served just under its maximum age", async () => {
+    // The other side of the bound: ageing out must not be so eager that the
+    // burst of reads this cache exists for stops being a burst.
+    jest.useFakeTimers();
+    try {
+      const { build, backlinks } = backlinksSetup();
+
+      expect(await backlinks()).toEqual(["a.md"]);
+      jest.advanceTimersByTime(BACKLINKS_INDEX_MAX_AGE_MS - 1);
+      expect(await backlinks()).toEqual(["a.md"]);
+
+      expect(build).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test("a caller that mutates the backlinks it was handed cannot corrupt the cache", async () => {
+    // The cached index outlives the response built from it, so handing out its
+    // own arrays would let one client's mutation reach the next client.
+    const { ops, file, backlinks } = backlinksSetup();
+
+    const first = (await ops.getFileMetadataObject(file)).backlinks;
+    first.push("injected.md");
+
+    expect(await backlinks()).toEqual(["a.md"]);
+  });
+
+  test("an explicitly supplied index still wins over the cache", async () => {
+    // Bulk callers pass one snapshot through their whole loop deliberately, so
+    // that every row of a result set describes the same moment.
+    const { ops, file, build } = backlinksSetup();
+
+    const supplied = { "note.md": ["snapshot.md"] };
+    const meta = await ops.getFileMetadataObject(file, supplied);
+
+    expect(meta.backlinks).toEqual(["snapshot.md"]);
+    expect(build).not.toHaveBeenCalled();
+  });
+
+  test("dispose unregisters the invalidation listeners", async () => {
+    // VaultOperations lives as long as the plugin, and its listeners must not
+    // outlive it: one left behind holds the old instance alive and goes on
+    // writing to a cache nobody reads.
+    const { app, ops, build, backlinks } = backlinksSetup();
+
+    await backlinks();
+    ops.dispose();
+
+    for (const event of METADATA_CACHE_EVENTS) {
+      app.metadataCache._emit(event, new TFile(), null);
+    }
+    for (const event of VAULT_EVENTS) {
+      app.vault._emit(event, new TFile(), "old.md");
+    }
+
+    await backlinks();
+    expect(build).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The listener set is only ever as complete as Obsidian's own event surface.
+//
+// Subscribing to every declared event answers "did we pick the right subset?",
+// but not "what if a later Obsidian release adds one?" -- a hardcoded list would
+// silently stop covering the graph the day that happens. These read the event
+// names back out of the installed typings, so an upgrade that adds or renames an
+// event is a failing test rather than a cache that quietly goes stale.
+//
+// This only sees what Obsidian declares publicly. An undocumented internal path
+// that rewrites resolvedLinks is covered by BACKLINKS_INDEX_MAX_AGE_MS instead.
+// ---------------------------------------------------------------------------
+
+describe("Obsidian's declared event surface", () => {
+
+  test("the cache is invalidated by every metadataCache event", () => {
+    expect([...METADATA_CACHE_EVENTS].sort()).toEqual(
+      declaredEvents("MetadataCache"),
+    );
+  });
+
+  test("the cache is invalidated by every vault event", () => {
+    expect([...VAULT_EVENTS].sort()).toEqual(declaredEvents("Vault"));
+  });
+
+  test("an event mentioned only in a comment is not counted as declared", () => {
+    // obsidian 1.14's JSDoc on MetadataCache's `changed` event links to
+    // `Vault.on(name: 'rename')`; reading that as a declaration made both
+    // guard suites demand a MetadataCache "rename" event that does not exist.
+    const typings = [
+      "export class Cache extends Events {",
+      "    /**",
+      "     * You must hook the {@link Vault.on | Vault.on(name: 'rename')} event.",
+      "     */",
+      "    on(name: 'changed', callback: () => any): EventRef;",
+      "    // on(name: 'commented-out', callback: () => any): EventRef;",
+      "    on(name: 'deleted', callback: () => any): EventRef;",
+      "}",
+      "export class Other extends Events {",
+      "    on(name: 'elsewhere', callback: () => any): EventRef;",
+      "}",
+    ].join("\n");
+
+    expect(declaredEvents("Cache", typings)).toEqual(["changed", "deleted"]);
+  });
+
+  test("comment markers inside string types do not hide later declarations", () => {
+    // A guard that drops a declaration passes while missing a new event, so a
+    // glob or URL in a type must not swallow the lines after it.
+    const typings = [
+      "export class Cache extends Events {",
+      "    pattern: '**/*.md';",
+      "    homepage: 'https://obsidian.md';",
+      "    on(name: 'changed', callback: () => any): EventRef;",
+      "    /** Ends the comment the glob above did not start. */",
+      "    on(name: 'deleted', callback: () => any): EventRef;",
+      "}",
+    ].join("\n");
+
+    expect(declaredEvents("Cache", typings)).toEqual(["changed", "deleted"]);
+  });
+});
+
+describe("openVaultFile", () => {
+  // openVaultFile is deliberately fire-and-forget (see its doc comment): the
+  // caller, POST /open/, has already sent its response by the time
+  // openLinkText settles. That only works because the rejection is caught
+  // internally instead of being left for an unhandled-rejection handler that
+  // doesn't exist -- a regression here would not fail loudly, just silently
+  // reintroduce an unhandled rejection.
+  test("opens the given path without awaiting completion", () => {
+    const { app, ops } = setup("content\n");
+    const openLinkText = jest.spyOn(app.workspace, "openLinkText").mockResolvedValue();
+
+    ops.openVaultFile(MD_PATH, true);
+
+    expect(openLinkText).toHaveBeenCalledWith(MD_PATH, "/", true);
+  });
+
+  test("a rejection from openLinkText is caught, not left unhandled", async () => {
+    const { app, ops } = setup("content\n");
+    jest.spyOn(app.workspace, "openLinkText").mockRejectedValue(new Error("no such leaf"));
+    const consoleError = jest.spyOn(console, "error").mockImplementation(() => {});
+
+    ops.openVaultFile(MD_PATH);
+    // Let the rejected promise's .catch handler run.
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining(MD_PATH),
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
+  });
+});
+
+// -------------------------------------------------------------------------
+// Vault-path containment is enforced here, not only at the API boundaries.
+//
+// VaultOperations is the one place every caller funnels through — the REST
+// handler, the MCP tools, and any plugin holding the extension API — so the
+// traversal guard lives here as well as at each boundary. The boundaries give
+// the caller a good error message; this stops anything that slips past one.
+//
+// The asymmetry that made this worth doing: reads go through
+// getAbstractFileByPath, which only matches indexed vault files and so misses
+// harmlessly on "../x.md", while writes and permanent deletes go through
+// Vault.create / adapter.writeBinary / adapter.remove, which take the path to
+// the filesystem relative to the vault directory and happily leave it.
+// ---------------------------------------------------------------------------
+
+describe("vault path containment", () => {
+  const ESCAPING = [
+    ["relative traversal", "../../Ausserhalb.md"],
+    ["absolute path", "/etc/passwd"],
+    ["traversal in the middle", "notes/../../outside.md"],
+    ["windows-style traversal", "..\\..\\outside.md"],
+  ] as const;
+
+  function opsFor(): { app: App; ops: VaultOperations } {
+    return setup("original\n");
+  }
+
+  for (const [label, escaping] of ESCAPING) {
+    describe(label, () => {
+      test("writeFileContent refuses to write text outside the vault", async () => {
+        const { app, ops } = opsFor();
+        await expect(ops.writeFileContent(escaping, "pwned")).rejects.toThrow(
+          "must not escape the vault root",
+        );
+        expect(app.vault._create).toBeUndefined();
+        expect(app.vault._modify).toBeUndefined();
+        expect(app.vault.adapter._write).toBeUndefined();
+      });
+
+      test("writeFileContent refuses to write bytes outside the vault", async () => {
+        const { app, ops } = opsFor();
+        await expect(
+          ops.writeFileContent(escaping, Buffer.from([1, 2, 3])),
+        ).rejects.toThrow("must not escape the vault root");
+        expect(app.vault.adapter._writeBinary).toBeUndefined();
+      });
+
+      test("appendFileContent refuses to create outside the vault", async () => {
+        const { app, ops } = setup("", false);
+        await expect(ops.appendFileContent(escaping, "pwned")).rejects.toThrow(
+          "must not escape the vault root",
+        );
+        expect(app.vault._create).toBeUndefined();
+      });
+
+      test("deleteVaultFile refuses a permanent delete outside the vault", async () => {
+        const { app, ops } = opsFor();
+        await expect(ops.deleteVaultFile(escaping, true)).rejects.toThrow(
+          "must not escape the vault root",
+        );
+        expect(app.vault.adapter._remove).toBeUndefined();
+      });
+
+      test("deleteVaultFile refuses a trashing delete outside the vault", async () => {
+        const { app, ops } = opsFor();
+        await expect(ops.deleteVaultFile(escaping, false)).rejects.toThrow(
+          "must not escape the vault root",
+        );
+        expect(app.fileManager._trashFile).toBeUndefined();
+      });
+
+      test("moveVaultFile refuses an escaping destination", async () => {
+        const { app, ops } = opsFor();
+        await expect(ops.moveVaultFile(MD_PATH, escaping)).rejects.toThrow(
+          "must not escape the vault root",
+        );
+        expect(app.vault.adapter._remove).toBeUndefined();
+      });
+
+      test("moveVaultFile refuses an escaping source", async () => {
+        const { ops } = opsFor();
+        await expect(ops.moveVaultFile(escaping, "inside.md")).rejects.toThrow(
+          "must not escape the vault root",
+        );
+      });
+
+      test("copyVaultFile refuses an escaping destination", async () => {
+        const { app, ops } = opsFor();
+        await expect(ops.copyVaultFile(MD_PATH, escaping)).rejects.toThrow(
+          "must not escape the vault root",
+        );
+        expect(app.vault.adapter._remove).toBeUndefined();
+      });
+
+      test("copyVaultFile refuses an escaping source", async () => {
+        const { ops } = opsFor();
+        await expect(ops.copyVaultFile(escaping, "inside.md")).rejects.toThrow(
+          "must not escape the vault root",
+        );
+      });
+
+      test("readFileContent refuses to read outside the vault", async () => {
+        const { ops } = opsFor();
+        await expect(ops.readFileContent(escaping)).rejects.toThrow(
+          "must not escape the vault root",
+        );
+      });
+
+      test("readBinaryFileContent refuses to read outside the vault", async () => {
+        const { ops } = opsFor();
+        await expect(ops.readBinaryFileContent(escaping)).rejects.toThrow(
+          "must not escape the vault root",
+        );
+      });
+
+      test("patchFileSectionMdp2 refuses to patch outside the vault", async () => {
+        const { ops } = opsFor();
+        await expect(
+          ops.patchFileSectionMdp2(escaping, {
+            targetType: "frontmatter",
+            target: "title",
+            operation: "replace",
+            value: "x",
+          }),
+        ).rejects.toThrow("must not escape the vault root");
+      });
+
+      test("listVaultDirectory refuses to list outside the vault", async () => {
+        const { ops } = opsFor();
+        await expect(ops.listVaultDirectory(escaping)).rejects.toThrow(
+          "must not escape the vault root",
+        );
+      });
+
+      test("openVaultFile refuses to open outside the vault", () => {
+        const { ops } = opsFor();
+        expect(() => ops.openVaultFile(escaping)).toThrow(
+          "must not escape the vault root",
+        );
+      });
+    });
+  }
+
+  describe("paths that stay inside are untouched", () => {
+    test("a nested path still writes", async () => {
+      const { app, ops } = setup("", false);
+      await ops.writeFileContent("folder/sub/note.md", "hello");
+      expect(app.vault._create).toEqual(["folder/sub/note.md", "hello"]);
+    });
+
+    test("'..' as a filename substring is not a traversal", async () => {
+      const { app, ops } = setup("", false);
+      await ops.writeFileContent("folder/notes..md", "hello");
+      expect(app.vault._create).toEqual(["folder/notes..md", "hello"]);
+    });
+
+    test("a leading './' is not a traversal", async () => {
+      const { app, ops } = setup("", false);
+      await ops.writeFileContent("./note.md", "hello");
+      expect(app.vault._create?.[1]).toBe("hello");
+    });
+
+    test("the empty path still lists the vault root", async () => {
+      const { ops } = opsFor();
+      await expect(ops.listVaultDirectory("")).resolves.toBeDefined();
+    });
+  });
+});
+
+describe("the configuration-directory backstop consults the disk", () => {
+  // VaultOperations is the last gate before the adapter, so a spelling the
+  // filesystem resolves to the config dir -- an NTFS 8.3 short name, a symlink
+  // -- must be refused here too, not only at the REST and MCP boundaries.
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  function setupOnDisk(): VaultOperations {
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    jest.spyOn(fs.realpathSync, "native").mockImplementation(
+      fakeRealpath({ "/vault/OBSIDI~1": "/vault/.obsidian" }, [
+        "/vault",
+        "/vault/.obsidian",
+      ]),
+    );
+    return new VaultOperations(app, {} as LocalRestApiSettings);
+  }
+
+  test("readBinaryPath refuses an 8.3 short name for the config dir", async () => {
+    const ops = setupOnDisk();
+    await expect(ops.readBinaryPath("OBSIDI~1/plugins/pwn/data.json")).rejects.toThrow(
+      ConfigDirAccessError,
+    );
+  });
+
+  test("writeFileContent refuses an 8.3 short name for the config dir", async () => {
+    const ops = setupOnDisk();
+    await expect(
+      ops.writeFileContent("OBSIDI~1/plugins/pwn/main.js", Buffer.from("pwned")),
+    ).rejects.toThrow(ConfigDirAccessError);
+  });
+
+  test("statPath refuses an 8.3 short name for the config dir", async () => {
+    const ops = setupOnDisk();
+    await expect(ops.statPath("OBSIDI~1")).rejects.toThrow(ConfigDirAccessError);
+  });
+});
+
+describe("bulk reads skip indexed files that live in the configuration directory", () => {
+  // Obsidian never indexes a dot-directory, so the only way a config-dir file is
+  // in getMarkdownFiles() is a symlink the owner planted in the vault. Direct
+  // reads of such a path are refused; a search must not hand its contents out
+  // instead.
+  afterEach(() => {
+    jest.restoreAllMocks();
+    _prepareSimpleSearchMock.behavior = null;
+  });
+
+  function mdFile(filePath: string): TFile {
+    const file = new TFile();
+    file.path = filePath;
+    file.basename = path.basename(filePath, ".md");
+    return file;
+  }
+
+  function setupIndexedAlias(): { app: App; ops: VaultOperations } {
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    jest.spyOn(fs.realpathSync, "native").mockImplementation(
+      fakeRealpath({ "/vault/notes/cfg": "/vault/.obsidian" }, [
+        "/vault",
+        "/vault/.obsidian",
+        "/vault/notes",
+      ]),
+    );
+    app.vault._markdownFiles = [mdFile("notes/a.md"), mdFile("notes/cfg/README.md")];
+    app.vault._cachedRead = "needle";
+    return { app, ops: new VaultOperations(app, {} as LocalRestApiSettings) };
+  }
+
+  test("simpleSearch does not read or return the aliased file", async () => {
+    const { ops } = setupIndexedAlias();
+    _prepareSimpleSearchMock.behavior = () => () => ({ score: 1, matches: [[0, 6]] });
+    const { results } = await ops.simpleSearch("needle");
+    expect(results.map((r) => r.filename)).toEqual(["notes/a.md"]);
+  });
+
+  test("searchJsonLogic does not read or return the aliased file", async () => {
+    const { ops } = setupIndexedAlias();
+    const { results } = await ops.searchJsonLogic({ var: "content" });
+    expect(results.map((r) => r.filename)).toEqual(["notes/a.md"]);
+  });
+
+  test("getAllTags does not count the aliased file", async () => {
+    const { app, ops } = setupIndexedAlias();
+    app.metadataCache._getFileCache = { tags: [{ tag: "#t" }] } as unknown as CachedMetadata;
+    expect(ops.getAllTags()).toEqual([{ name: "t", count: 1 }]);
+  });
+
+  test("both are served when access is enabled", async () => {
+    const { app } = setupIndexedAlias();
+    const ops = new VaultOperations(app, {
+      enableConfigDirAccess: true,
+    } as LocalRestApiSettings);
+    const { results } = await ops.searchJsonLogic({ var: "path" });
+    expect(results.map((r) => r.filename)).toEqual(["notes/a.md", "notes/cfg/README.md"]);
+  });
+
+  test("getFileMetadataObject refuses a TFile inside the config dir", async () => {
+    const { ops } = setupIndexedAlias();
+    await expect(ops.getFileMetadataObject(mdFile("notes/cfg/README.md"))).rejects.toThrow(
+      ConfigDirAccessError,
+    );
+  });
+
+  test("renderFileToHtml refuses a TFile inside the config dir", async () => {
+    const { ops } = setupIndexedAlias();
+    await expect(ops.renderFileToHtml(mdFile("notes/cfg/README.md"))).rejects.toThrow(
+      ConfigDirAccessError,
+    );
+  });
+});
+
+describe("resolvePathAndTarget authorizes every prefix it stats", () => {
+  // The joined address can resolve to a harmless place while a prefix of it is
+  // the protected file: "notes/cfg/README.md/comments/../../../safe" is
+  // "notes/safe" once resolved, but the backward walk stats "notes/cfg/README.md"
+  // on the way there. Each stat goes through the gate, so a refused prefix is a
+  // miss rather than a hit.
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test("a protected prefix behind a resolving address is not found", async () => {
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    app.vault.adapter._statForPath = "notes/cfg/README.md";
+    jest.spyOn(fs.realpathSync, "native").mockImplementation(
+      fakeRealpath({ "/vault/notes/cfg": "/vault/.obsidian" }, [
+        "/vault",
+        "/vault/.obsidian",
+        "/vault/.obsidian/README.md",
+        "/vault/notes",
+      ]),
+    );
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    const resolved = await ops.resolvePathAndTarget([
+      "notes",
+      "cfg",
+      "README.md",
+      "comments",
+      "../../../safe",
+    ]);
+    expect(resolved).toBeNull();
+  });
+
+  test("a failure that is not a gate refusal surfaces instead of reading as a miss", async () => {
+    // The gate answers with PathTraversalError or ConfigDirAccessError. Anything
+    // else thrown while deciding -- here the adapter failing to say where the
+    // vault is -- is a fault, and turning it into "no file here" would hide it
+    // behind a 404.
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    jest.spyOn(app.vault.adapter, "getBasePath").mockImplementation(() => {
+      throw new Error("adapter has no base path");
+    });
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    await expect(
+      ops.resolvePathAndTarget(["notes", "a.md", "heading", "Intro"]),
+    ).rejects.toThrow("adapter has no base path");
+  });
+
+  test("the same walk still finds an ordinary file", async () => {
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    app.vault.adapter._statForPath = "notes/a.md";
+    jest.spyOn(fs.realpathSync, "native").mockImplementation(
+      fakeRealpath({}, ["/vault", "/vault/.obsidian", "/vault/notes", "/vault/notes/a.md"]),
+    );
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    const resolved = await ops.resolvePathAndTarget(["notes", "a.md", "heading", "Intro"]);
+    expect(resolved).toEqual({
+      filePath: "notes/a.md",
+      targetType: "heading",
+      target: "Intro",
+      targetSegments: ["Intro"],
+    });
+  });
+});
+
+describe("a write through a dangling symlink into the config dir is refused", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  test("writeFileContent follows the link to where the file would be created", async () => {
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    jest.spyOn(fs.realpathSync, "native").mockImplementation(
+      fakeRealpath({}, [
+        "/",
+        "/vault",
+        "/vault/notes",
+        "/vault/.obsidian",
+        "/vault/.obsidian/plugins",
+      ]),
+    );
+    jest.spyOn(fs, "readlinkSync").mockImplementation((p) => {
+      const target = fakeReadlink({
+        "/vault/notes/upload.bin": "../.obsidian/plugins/demo/main.js",
+      })(String(p));
+      if (target === undefined) throw Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+      return target;
+    });
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    await expect(
+      ops.writeFileContent("notes/upload.bin", Buffer.from("pwned")),
+    ).rejects.toThrow(ConfigDirAccessError);
+  });
+});
+
+describe("a write that replaces an entry checks where the entry's parent lands", () => {
+  // The gate follows a symlink to its target. A symlink the owner planted
+  // *inside* the config dir that points back into the vault therefore passes,
+  // and an overwrite then removes the link and creates a real file at the same
+  // spelling -- inside the config dir. The entry is created in its parent, so
+  // the parent has to be allowed too, before anything is removed.
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  const LINK = "notes/cfg/plugins/foo/link.md";
+
+  function setup(): App {
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    jest.spyOn(fs.realpathSync, "native").mockImplementation(
+      fakeRealpath(
+        {
+          "/vault/notes/cfg": "/vault/.obsidian",
+          "/vault/.obsidian/plugins/foo/link.md": "/vault/notes/z.md",
+        },
+        [
+          "/vault",
+          "/vault/notes",
+          "/vault/notes/z.md",
+          "/vault/notes/payload.md",
+          "/vault/.obsidian",
+          "/vault/.obsidian/plugins",
+          "/vault/.obsidian/plugins/foo",
+        ],
+      ),
+    );
+    return app;
+  }
+
+  test("MOVE with overwrite onto such a link is refused before the link is removed", async () => {
+    const app = setup();
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    await expect(ops.moveVaultFile("notes/payload.md", LINK, true)).rejects.toThrow(
+      ConfigDirAccessError,
+    );
+    expect(app.vault.adapter._remove).toBeUndefined();
+  });
+
+  test("COPY with overwrite onto such a link is refused before the link is removed", async () => {
+    const app = setup();
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    await expect(ops.copyVaultFile("notes/payload.md", LINK, true)).rejects.toThrow(
+      ConfigDirAccessError,
+    );
+    expect(app.vault.adapter._remove).toBeUndefined();
+  });
+
+  test("permanent DELETE of such a link is refused", async () => {
+    const app = setup();
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    await expect(ops.deleteVaultFile(LINK, true)).rejects.toThrow(ConfigDirAccessError);
+    expect(app.vault.adapter._remove).toBeUndefined();
+  });
+
+  test("DELETE to trash of such a link is refused", async () => {
+    const app = setup();
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    await expect(ops.deleteVaultFile(LINK, false)).rejects.toThrow(ConfigDirAccessError);
+  });
+
+  test("an ordinary overwrite still proceeds", async () => {
+    const app = setup();
+    Object.assign(app.fileManager, { renameFile: jest.fn() });
+    const ops = new VaultOperations(app, {} as LocalRestApiSettings);
+    await ops.moveVaultFile("notes/payload.md", "notes/z.md", true);
+    expect(app.vault.adapter._remove).toEqual(["notes/z.md"]);
+  });
+});
+
+describe("bulk reads skip a .md-named symlink into the configuration directory", () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+    _prepareSimpleSearchMock.behavior = null;
+  });
+
+  function mdFile(filePath: string): TFile {
+    const file = new TFile();
+    file.path = filePath;
+    file.basename = path.basename(filePath, ".md");
+    return file;
+  }
+
+  function setup(): { app: App; ops: VaultOperations; readlink: jest.SpyInstance } {
+    const app = new App();
+    app.vault.adapter = new FileSystemAdapter("/vault");
+    jest.spyOn(fs.realpathSync, "native").mockImplementation(
+      fakeRealpath({ "/vault/notes/key.md": "/vault/.obsidian/plugins/x/data.json" }, [
+        "/vault",
+        "/vault/notes",
+        "/vault/notes/a.md",
+        "/vault/.obsidian",
+        "/vault/.obsidian/plugins",
+        "/vault/.obsidian/plugins/x",
+        "/vault/.obsidian/plugins/x/data.json",
+      ]),
+    );
+    const readlink = jest.spyOn(fs, "readlinkSync").mockImplementation((p) => {
+      const target = fakeReadlink({
+        "/vault/notes/key.md": "../.obsidian/plugins/x/data.json",
+      })(String(p));
+      if (target === undefined) throw Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+      return target;
+    });
+    app.vault._markdownFiles = [mdFile("notes/a.md"), mdFile("notes/key.md")];
+    app.vault._cachedRead = "apiKey";
+    return { app, ops: new VaultOperations(app, {} as LocalRestApiSettings), readlink };
+  }
+
+  test("simpleSearch does not return the link", async () => {
+    const { ops } = setup();
+    _prepareSimpleSearchMock.behavior = () => () => ({ score: 1, matches: [[0, 6]] });
+    const { results } = await ops.simpleSearch("apiKey");
+    expect(results.map((r) => r.filename)).toEqual(["notes/a.md"]);
+  });
+
+  test("searchJsonLogic does not return the link", async () => {
+    const { ops } = setup();
+    const { results } = await ops.searchJsonLogic({ var: "content" });
+    expect(results.map((r) => r.filename)).toEqual(["notes/a.md"]);
+  });
+
+  test("the per-file readlink is remembered across searches while the file is unchanged", async () => {
+    const { ops, readlink } = setup();
+    await ops.searchJsonLogic({ var: "path" });
+    const afterFirst = readlink.mock.calls.length;
+    expect(afterFirst).toBe(2);
+    await ops.searchJsonLogic({ var: "path" });
+    expect(readlink.mock.calls.length).toBe(afterFirst);
+  });
+});

@@ -5,7 +5,15 @@ import globals from "globals";
 
 export default defineConfig([
   {
-    ignores: ["dist/", "docs/", "node_modules/", "main.js", "main.d.ts"],
+    // main.js, publicApi.js and publicApi.d.ts are build output, not source.
+    ignores: [
+      "dist/",
+      "docs/",
+      "node_modules/",
+      "main.js",
+      "publicApi.js",
+      "publicApi.d.ts",
+    ],
   },
 
   ...obsidianmd.configs.recommended,
@@ -27,10 +35,6 @@ export default defineConfig([
       // false positives for ambient Obsidian types in declare-module blocks.
       "no-undef": "off",
 
-      // Some CommonJS-only dependencies (json-logic-js, glob-to-regexp) cannot
-      // be imported with ESM syntax; require() is the only option.
-      "@typescript-eslint/no-require-imports": "off",
-
       "@typescript-eslint/no-unsafe-argument": "error",
       "@typescript-eslint/no-unsafe-assignment": "error",
       "@typescript-eslint/no-unsafe-call": "error",
@@ -39,8 +43,11 @@ export default defineConfig([
       "@typescript-eslint/no-unsafe-enum-comparison": "error",
 
       // Acronyms and brand names that must stay capitalised in UI text.
+      // Severity is warn, not error: the community plugin review only forbids
+      // disabling this rule, and mid-sentence link texts legitimately start
+      // lowercase, so violations should not fail CI.
       "obsidianmd/ui/sentence-case": [
-        "error",
+        "warn",
         {
           acronyms: ["REST", "API", "MCP", "HTTPS", "HTTP", "URL", "JSON", "CSS", "HTML", "SSL", "TLS"],
           brands: ["Obsidian", "Claude"],
@@ -63,6 +70,9 @@ export default defineConfig([
       "obsidianmd/no-nodejs-modules": "off",
       // Tests run in Node.js via Jest, not a browser/Obsidian window context.
       "obsidianmd/prefer-window-timers": "off",
+      // Production code must read Vault#configDir (and does); the tests for that
+      // guard spell out `.obsidian` on purpose, as the literal under test.
+      "obsidianmd/hardcoded-config-path": "off",
       // Jest legitimately passes unbound methods to expect() matchers.
       "@typescript-eslint/unbound-method": "off",
       // Tests work with JSON.parse results, mock return values, and API responses
@@ -89,6 +99,8 @@ export default defineConfig([
     rules: {
       "obsidianmd/no-nodejs-modules": "off",
       "obsidianmd/prefer-window-timers": "off",
+      // The config-dir guard's tests name `.obsidian` deliberately; see the unit-test block.
+      "obsidianmd/hardcoded-config-path": "off",
       "no-restricted-globals": "off",
       // Same rationale as unit tests: integration tests exercise live API responses
       // whose shapes are verified by the assertions, not the type system.

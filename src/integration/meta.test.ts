@@ -1,4 +1,10 @@
-import { authedFetch, unauthFetch, ensureServerReachable } from "./client";
+import * as tls from "tls";
+
+import forge from "node-forge";
+
+import { CERT_NAME } from "../constants";
+import { authedFetch, unauthFetch, ensureServerReachable, resetFixture, deleteFixture } from "./client";
+import { TEST_DIR } from "./fixtures";
 
 beforeAll(async () => {
   await ensureServerReachable();
@@ -32,6 +38,59 @@ describe("GET /", () => {
     expect(typeof body.versions?.obsidian).toBe("string");
     expect(typeof body.versions?.self).toBe("string");
   });
+
+  describe("state", () => {
+    interface MetadataCacheState {
+      listeningSince: string;
+      lastResolvedAt: string | null;
+      lastActivityAt: string | null;
+    }
+
+    const STATE_PATH = `${TEST_DIR}/state-observation.md`;
+
+    async function metadataCacheState(): Promise<MetadataCacheState> {
+      const body = (await (await authedFetch("/")).json()) as { state: { metadataCache: MetadataCacheState } };
+      return body.state.metadataCache;
+    }
+
+    const isTimestamp = (value: unknown) =>
+      typeof value === "string" && !Number.isNaN(Date.parse(value)) && new Date(value).toISOString() === value;
+
+    afterAll(async () => {
+      await deleteFixture(STATE_PATH);
+    });
+
+    test("is withheld from unauthenticated callers", async () => {
+      const body = await (await unauthFetch("/")).json();
+      expect(body.state).toBeUndefined();
+    });
+
+    test("reports the metadata cache observations as ISO 8601 timestamps or null", async () => {
+      const state = await metadataCacheState();
+      expect(isTimestamp(state.listeningSince)).toBe(true);
+      for (const value of [state.lastResolvedAt, state.lastActivityAt]) {
+        expect(value === null || isTimestamp(value)).toBe(true);
+      }
+      if (state.lastActivityAt !== null) {
+        expect(Date.parse(state.lastActivityAt)).toBeGreaterThanOrEqual(Date.parse(state.listeningSince));
+      }
+    });
+
+    test("hears a note being written as metadata cache activity", async () => {
+      const before = await metadataCacheState();
+      await resetFixture(`# State\n\nWritten at ${Date.now()} with a [[link to nowhere]].\n`, STATE_PATH);
+
+      const deadline = Date.now() + 5000;
+      let after = await metadataCacheState();
+      while (after.lastActivityAt === before.lastActivityAt && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        after = await metadataCacheState();
+      }
+      expect(after.lastActivityAt).not.toBe(before.lastActivityAt);
+      expect(isTimestamp(after.lastActivityAt)).toBe(true);
+      expect(after.listeningSince).toBe(before.listeningSince);
+    });
+  });
 });
 
 describe("GET /openapi.yaml", () => {
@@ -45,5 +104,75 @@ describe("GET /openapi.yaml", () => {
   test("content-type includes yaml", async () => {
     const res = await unauthFetch("/openapi.yaml");
     expect(res.headers.get("content-type")).toMatch(/yaml/);
+  });
+});
+
+describe("GET /openapi.json", () => {
+  test("returns the spec as JSON without auth", async () => {
+    const res = await unauthFetch("/openapi.json");
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toMatch(/json/);
+    const body = await res.json();
+    expect(typeof body.openapi).toBe("string");
+    expect(body.paths["/openapi.json"]).toBeDefined();
+  });
+});
+
+describe("certificate material", () => {
+  // The integration suite talks to the HTTP server; the certificate checks
+  // need the HTTPS one, which the plugin enables by default on 27124.
+  const HTTPS_URL = (process.env.OBSIDIAN_HTTPS_HOST ?? "https://localhost:27124").replace(/\/$/, "");
+
+  function certificateFromDer(der: Buffer): forge.pki.Certificate {
+    return forge.pki.certificateFromAsn1(forge.asn1.fromDer(der.toString("binary")));
+  }
+
+  // Fetch the certificate the HTTPS server actually presents in the handshake,
+  // without trusting it: the point is to inspect it, not to validate it.
+  function fetchServedCertificate(): Promise<forge.pki.Certificate> {
+    const { hostname, port } = new URL(HTTPS_URL);
+    return new Promise((resolve, reject) => {
+      const socket = tls.connect(
+        { host: hostname, port: Number(port), rejectUnauthorized: false, servername: hostname },
+        () => {
+          const peer = socket.getPeerCertificate();
+          socket.end();
+          resolve(certificateFromDer(peer.raw));
+        },
+      );
+      socket.on("error", reject);
+    });
+  }
+
+  test("the downloadable certificate is a certificate authority that the served certificate chains to", async () => {
+    const downloadRes = await unauthFetch(`/${CERT_NAME}`);
+    expect(downloadRes.status).toBe(200);
+    const downloaded = forge.pki.certificateFromPem(await downloadRes.text());
+    const served = await fetchServedCertificate();
+
+    const infoRes = await authedFetch("/");
+    const info = (await infoRes.json()) as {
+      certificateInfo?: { regenerateRecommended: boolean; regenerateReason: string | null };
+    };
+    expect(info.certificateInfo).toBeDefined();
+
+    const basicConstraints = (name: forge.pki.Certificate) =>
+      name.getExtension("basicConstraints") as { cA?: boolean } | undefined;
+
+    if (info.certificateInfo?.regenerateReason === "ca-used-as-leaf") {
+      // This Obsidian still runs material from before the CA/leaf split: the
+      // download is the self-signed certificate itself, and the plugin says so.
+      expect(info.certificateInfo.regenerateRecommended).toBe(true);
+      expect(forge.pki.certificateToPem(served)).toEqual(forge.pki.certificateToPem(downloaded));
+      return;
+    }
+
+    expect(info.certificateInfo?.regenerateRecommended).toBe(false);
+    expect(basicConstraints(downloaded)?.cA).toBe(true);
+    expect(basicConstraints(served)?.cA).toBe(false);
+    expect(downloaded.issued(served)).toBe(true);
+    expect(downloaded.verify(served)).toBe(true);
+    const store = forge.pki.createCaStore([downloaded]);
+    expect(forge.pki.verifyCertificateChain(store, [served])).toBe(true);
   });
 });
