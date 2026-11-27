@@ -7,6 +7,17 @@ The Obsidian Local REST API with MCP plugin gives you two ways to interact with 
 
 Every write to a file accepts an `If-Match` header, so two clients editing the same note cannot silently overwrite each other. Read the file, keep the `ETag` it answers with, and send it back as `If-Match` on the write: if the file has changed in between, the write fails with `412` and nothing is written. `If-None-Match: *` makes a `PUT` create-only. The document map's `version` and note JSON's `version` are the same token as the `ETag`, and every write that changes a file answers with its new one.
 
+## Server-side limits
+
+These guards are set through environment variables of the Obsidian process; unset, the defaults apply.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OBSIDIAN_MAX_REQUEST_SIZE` | `10mb` | Largest request body accepted, in [express size format](https://www.npmjs.com/package/bytes) (e.g. `50mb`). Larger uploads, including to a signed upload URL, are refused until it is raised. |
+| `OBSIDIAN_SEARCH_LIMIT` | `500` | Most Markdown files a JsonLogic search evaluates. |
+| `OBSIDIAN_QUERY_TIMEOUT_MS` | `10000` | Longest a JsonLogic search runs, in milliseconds. |
+| `OBSIDIAN_ALLOWED_COMMANDS` | *(empty)* | Command IDs the MCP `command_execute` tool may run; empty disables the tool. |
+
 ## Testing with this interface
 
 Select any operation in the sidebar, then open the **Try It** tab to send a live request to your running Obsidian instance.

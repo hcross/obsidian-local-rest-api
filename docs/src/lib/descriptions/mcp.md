@@ -44,12 +44,16 @@ Requests with an unrecognized `MCP-Protocol-Version` value are rejected with `40
 | `vault_copy` | Copy a vault file to a new path |
 | `vault_get_document_map` | List the headings, block references, and frontmatter fields in a file |
 | `active_file_get_path` | Return the vault path of the file currently open in Obsidian |
-| `search_query` | Search using a JsonLogic query evaluated against each note's metadata |
+| `search_query` | Search using a JsonLogic query evaluated against each note's metadata; returns `{results, truncated}` |
 | `search_simple` | Full-text search using Obsidian's built-in search |
 | `tag_list` | List all tags across the vault with usage counts |
 | `command_list` | List all registered Obsidian commands |
-| `command_execute` | Execute an Obsidian command by ID |
+| `command_execute` | Execute an Obsidian command by ID (only IDs listed in `OBSIDIAN_ALLOWED_COMMANDS`) |
 | `open_file` | Open a file in the Obsidian UI |
+
+`command_execute` is disabled unless the Obsidian process has `OBSIDIAN_ALLOWED_COMMANDS` set to a comma-separated list of command IDs (for example `editor:toggle-bold,app:reload`); any other ID is refused. This allowlist applies to the MCP tool only; the REST `POST /commands/{commandId}/` route is not subject to it.
+
+`search_query` returns `{results, truncated}`: `truncated` is `true` when the search stopped at the file or time limit described under `POST /search/`, so `results` may be incomplete.
 
 `search_simple` returns at most the 20 highest-scoring files and the first 10 matches in each unless the call sets `maxResults` or `maxMatchesPerFile`. Obsidian's simple search matches each word of a query separately, so an unbounded search containing a common word can return megabytes, and an MCP result usually goes straight into the model's context. When anything was left out, a second text block beginning `[Search results limited:` says how much and how to see more. Its `contextLength` is at most 500 characters. `POST /search/simple/` takes the same two parameters but has no limit by default, and does not bound `contextLength`.
 

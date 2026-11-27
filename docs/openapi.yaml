@@ -237,6 +237,17 @@ info:
     
     Every write to a file accepts an `If-Match` header, so two clients editing the same note cannot silently overwrite each other. Read the file, keep the `ETag` it answers with, and send it back as `If-Match` on the write: if the file has changed in between, the write fails with `412` and nothing is written. `If-None-Match: *` makes a `PUT` create-only. The document map's `version` and note JSON's `version` are the same token as the `ETag`, and every write that changes a file answers with its new one.
     
+    ## Server-side limits
+    
+    These guards are set through environment variables of the Obsidian process; unset, the defaults apply.
+    
+    | Variable | Default | Effect |
+    |---|---|---|
+    | `OBSIDIAN_MAX_REQUEST_SIZE` | `10mb` | Largest request body accepted, in [express size format](https://www.npmjs.com/package/bytes) (e.g. `50mb`). Larger uploads, including to a signed upload URL, are refused until it is raised. |
+    | `OBSIDIAN_SEARCH_LIMIT` | `500` | Most Markdown files a JsonLogic search evaluates. |
+    | `OBSIDIAN_QUERY_TIMEOUT_MS` | `10000` | Longest a JsonLogic search runs, in milliseconds. |
+    | `OBSIDIAN_ALLOWED_COMMANDS` | *(empty)* | Command IDs the MCP `command_execute` tool may run; empty disables the tool. |
+    
     ## Testing with this interface
     
     Select any operation in the sidebar, then open the **Try It** tab to send a live request to your running Obsidian instance.
@@ -1998,12 +2009,16 @@ paths:
         | `vault_copy` | Copy a vault file to a new path |
         | `vault_get_document_map` | List the headings, block references, and frontmatter fields in a file |
         | `active_file_get_path` | Return the vault path of the file currently open in Obsidian |
-        | `search_query` | Search using a JsonLogic query evaluated against each note's metadata |
+        | `search_query` | Search using a JsonLogic query evaluated against each note's metadata; returns `{results, truncated}` |
         | `search_simple` | Full-text search using Obsidian's built-in search |
         | `tag_list` | List all tags across the vault with usage counts |
         | `command_list` | List all registered Obsidian commands |
-        | `command_execute` | Execute an Obsidian command by ID |
+        | `command_execute` | Execute an Obsidian command by ID (only IDs listed in `OBSIDIAN_ALLOWED_COMMANDS`) |
         | `open_file` | Open a file in the Obsidian UI |
+        
+        `command_execute` is disabled unless the Obsidian process has `OBSIDIAN_ALLOWED_COMMANDS` set to a comma-separated list of command IDs (for example `editor:toggle-bold,app:reload`); any other ID is refused. This allowlist applies to the MCP tool only; the REST `POST /commands/{commandId}/` route is not subject to it.
+        
+        `search_query` returns `{results, truncated}`: `truncated` is `true` when the search stopped at the file or time limit described under `POST /search/`, so `results` may be incomplete.
         
         `search_simple` returns at most the 20 highest-scoring files and the first 10 matches in each unless the call sets `maxResults` or `maxMatchesPerFile`. Obsidian's simple search matches each word of a query separately, so an unbounded search containing a common word can return megabytes, and an MCP result usually goes straight into the model's context. When anything was left out, a second text block beginning `[Search results limited:` says how much and how to see more. Its `contextLength` is at most 500 characters. `POST /search/simple/` takes the same two parameters but has no limit by default, and does not bound `contextLength`.
         
@@ -2275,7 +2290,7 @@ paths:
         Accepts a JsonLogic query specified as JSON.  See [JsonLogic](https://jsonlogic.com/operations.html)'s documentation for information about the base set of operators available, but in addition to those operators the following operators are available:
         
         - `glob: [PATTERN, VALUE]`: Returns `true` if a string matches a glob pattern.  E.g.: `{"glob": ["*.foo", "bar.foo"]}` is `true` and `{"glob": ["*.bar", "bar.foo"]}` is `false`.
-        - `regexp: [PATTERN, VALUE]`: Returns `true` if a string matches a regular expression.  E.g.: `{"regexp": [".*\.foo", "bar.foo"]` is `true` and `{"regexp": [".*\.bar", "bar.foo"]}` is `false`.
+        - `regexp: [PATTERN, VALUE]`: Returns `true` if a string matches a regular expression.  E.g.: `{"regexp": [".*\.foo", "bar.foo"]` is `true` and `{"regexp": [".*\.bar", "bar.foo"]}` is `false`. A pattern longer than 500 characters, or one rejected as potentially unsafe (catastrophic backtracking, "ReDoS"), fails the whole query with `400 InvalidFilterQuery` instead of being evaluated.
         
         Returns only non-falsy results.  "Non-falsy" here treats the following values as "falsy":
         
@@ -2297,6 +2312,10 @@ paths:
         route setting the header:
         `Accept: application/vnd.olrapi.note+json`.  See examples below
         for working examples of queries performing common search operations.
+        
+        ## Search limits
+        
+        To keep one query from monopolising Obsidian, a JsonLogic search evaluates at most **500 Markdown files** and stops after **10 seconds**, whichever comes first. When either limit cuts the search short, the response is still `200` with the matches found so far, and carries the header `X-Obsidian-Search-Truncated: true`; a complete search omits the header. The limits are set by the environment of the Obsidian process: `OBSIDIAN_SEARCH_LIMIT` (files, default `500`) and `OBSIDIAN_QUERY_TIMEOUT_MS` (milliseconds, default `10000`). The same limits apply to the MCP `search_query` tool, which reports them as a `truncated` boolean beside `results`.
       requestBody:
         content:
           "application/vnd.olrapi.jsonlogic+json":
@@ -2363,6 +2382,13 @@ paths:
                   type: "object"
                 type: "array"
           description: "Success"
+          headers:
+            X-Obsidian-Search-Truncated:
+              description: "Present, with the value `true`, only when the search stopped early at the file or time limit (see \"Search limits\" above), so the list may be incomplete."
+              schema:
+                enum:
+                  - "true"
+                type: "string"
         "400":
           content:
             application/json:

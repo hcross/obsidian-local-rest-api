@@ -662,6 +662,12 @@ std.manifestYamlDoc(
           responses: {
             '200': {
               description: 'Success',
+              headers: {
+                'X-Obsidian-Search-Truncated': {
+                  description: 'Present, with the value `true`, only when the search stopped early at the file or time limit (see "Search limits" above), so the list may be incomplete.',
+                  schema: { type: 'string', 'enum': ['true'] },
+                },
+              },
               content: {
                 'application/json': {
                   schema: {

@@ -7,7 +7,7 @@ This endpoint supports multiple query formats.  Your query should be specified i
 Accepts a JsonLogic query specified as JSON.  See [JsonLogic](https://jsonlogic.com/operations.html)'s documentation for information about the base set of operators available, but in addition to those operators the following operators are available:
 
 - `glob: [PATTERN, VALUE]`: Returns `true` if a string matches a glob pattern.  E.g.: `{"glob": ["*.foo", "bar.foo"]}` is `true` and `{"glob": ["*.bar", "bar.foo"]}` is `false`.
-- `regexp: [PATTERN, VALUE]`: Returns `true` if a string matches a regular expression.  E.g.: `{"regexp": [".*\.foo", "bar.foo"]` is `true` and `{"regexp": [".*\.bar", "bar.foo"]}` is `false`.
+- `regexp: [PATTERN, VALUE]`: Returns `true` if a string matches a regular expression.  E.g.: `{"regexp": [".*\.foo", "bar.foo"]` is `true` and `{"regexp": [".*\.bar", "bar.foo"]}` is `false`. A pattern longer than 500 characters, or one rejected as potentially unsafe (catastrophic backtracking, "ReDoS"), fails the whole query with `400 InvalidFilterQuery` instead of being evaluated.
 
 Returns only non-falsy results.  "Non-falsy" here treats the following values as "falsy":
 
@@ -29,3 +29,7 @@ are returned.  To see that, access the `GET` `/vault/{filePath}`
 route setting the header:
 `Accept: application/vnd.olrapi.note+json`.  See examples below
 for working examples of queries performing common search operations.
+
+## Search limits
+
+To keep one query from monopolising Obsidian, a JsonLogic search evaluates at most **500 Markdown files** and stops after **10 seconds**, whichever comes first. When either limit cuts the search short, the response is still `200` with the matches found so far, and carries the header `X-Obsidian-Search-Truncated: true`; a complete search omits the header. The limits are set by the environment of the Obsidian process: `OBSIDIAN_SEARCH_LIMIT` (files, default `500`) and `OBSIDIAN_QUERY_TIMEOUT_MS` (milliseconds, default `10000`). The same limits apply to the MCP `search_query` tool, which reports them as a `truncated` boolean beside `results`.
