@@ -29,3 +29,6 @@ dist/*
 
 # TLS certificates — must not be committed or synced via cloud vaults
 certs/
+
+# Local Obsidian vault used for manual testing
+test_vault/

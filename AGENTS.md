@@ -4,7 +4,9 @@
 
 ### Commit cadence
 
-Commit frequently in small, self-contained increments. Each commit must leave the repository in a working state — no broken builds, no failing unit tests. A commit that fixes a bug, a commit that adds a test, and a commit that updates documentation are all valid atomic units. Do not batch unrelated changes into a single commit.
+Commit frequently in small, self-contained increments. Each commit on `main` must leave the repository in a working state — no broken builds, no failing unit tests. A commit that fixes a bug, a commit that adds a test, and a commit that updates documentation are all valid atomic units. Do not batch unrelated changes into a single commit.
+
+When working on fixing a bug while on a branch off of `main`, follow a Test-Driven Development approach and start by creating (and committing) failing tests that will later be fixed by fixes your subsequent commits.
 
 ### Push Automatically
 
@@ -23,6 +25,30 @@ Integration tests require a live Obsidian instance with the plugin's insecure HT
 ```
 npm run test:integration
 ```
+
+Two groups of integration tests are skipped by default and opt in via environment
+variable, because each needs something of the person running them:
+
+- `OBSIDIAN_ACTIVE_FILE=<vault-relative path>` — enables the `active_file_*` tests, which
+  need that file open in Obsidian.
+- `OBSIDIAN_TEST_OPEN_FILE=1` — enables the `open_file` test. It is off by default
+  because opening a file pulls Obsidian to the foreground and takes keyboard focus
+  mid-run, so keystrokes meant for another window can land in the opened note.
+- `OBSIDIAN_TEST_COMMAND_EXECUTE=1` — enables the MCP `command_execute` test. The tool only
+  runs IDs listed in `OBSIDIAN_ALLOWED_COMMANDS` in *Obsidian's own* environment, which the
+  test runner cannot see, so launch Obsidian with `OBSIDIAN_ALLOWED_COMMANDS=editor:save-file`
+  first.
+- `OBSIDIAN_VAULT_PATH=<absolute path to the vault>` — enables the configuration-directory
+  symlink test, which plants a symlink to `.obsidian` under the integration fixture
+  directory (and removes it afterwards) to check the guard follows a path to where it
+  lands on disk.
+
+One group runs by default and opts *out* instead, because the feature it needs is on by
+default:
+
+- `OBSIDIAN_SIGNED_URLS=0` — skips the signed-URL upload/download round trip. Without it,
+  that test *fails* (naming the setting) when the running plugin has "Enable signed URLs"
+  turned off, rather than passing with nothing exercised.
 
 ### Commit message format
 
@@ -49,6 +75,8 @@ This project has several parallel representations of each API capability that mu
 | OpenAPI docs (compiled) | `docs/openapi.yaml` |
 | Unit tests | `src/requestHandler.test.ts`, `src/mcpHandler.test.ts` |
 | Integration tests | `src/integration/*.test.ts` |
+| Extension API (source) | `src/publicApi.ts` |
+| Extension API (compiled) | `publicApi.d.ts`, `publicApi.js` |
 
 After making any changes to REST API endpoints or MCP tools, be sure to update the matching OpenAPI docs and Project Readme entries regarding that feature.
 
@@ -71,6 +99,33 @@ npm run build-docs
 
 Stage the resulting `docs/openapi.yaml` alongside any Jsonnet changes. `src/mcpHandler.ts` imports this file directly, so a stale compiled spec means MCP clients receive outdated API documentation.
 
+### Regenerating the Readme table of contents
+
+`README.md` carries a `markdown-toc`-generated table of contents between the `<!-- toc -->` and `<!-- tocstop -->` markers. After adding, removing, or renaming any Readme heading, regenerate it and stage the result:
+
+```
+npm run build-toc
+```
+
+### Changing the extension API
+
+`src/publicApi.ts` is the single source of truth for what other plugins may depend on: the `LocalRestApiPublicApi` interface, `getAPI`, and their supporting types. `publicApi.d.ts` and `publicApi.js` at the repository root are generated from it and committed, and package.json's `types` and `main` fields point at them, so extension authors install a small standalone module rather than the plugin bundle.
+
+Two constraints hold this together:
+
+- **`src/publicApi.ts` may not import plugin internals.** Only `import type` from `obsidian`, `express`, and `zod`. Anything else leaks a relative import into the generated declaration and breaks for consumers.
+- **The implementation is checked against it in both directions.** `LocalRestApiPublicApiImpl` in `src/api.ts` declares `implements LocalRestApiPublicApi`, which catches a member the class dropped, and the `PublicSurfaceIsComplete` type at the bottom of that file catches a public member the class grew that the interface never learned about. Adding a public method to the class without documenting it in `src/publicApi.ts` fails `npm run typecheck`.
+
+After any change to `src/publicApi.ts`, regenerate and stage the compiled output:
+
+```
+npm run build-types
+```
+
+`npm run build` runs this too, and CI fails if the committed output does not match a fresh build. Bumping the extension API's capabilities means bumping `apiVersion` in `src/api.ts`, since `getAPI`'s optional version argument is what extension authors use to detect an older host.
+
+The generated module is also what ships to npm as the `obsidian-local-rest-api` package that extension authors install for typings. npm publication happens manually, by the user, as part of cutting a release whenever the extension API changed — see step 8 of the Release Process below.
+
 ### Checklist
 
 Before marking any endpoint-related change complete:
@@ -79,6 +134,8 @@ Before marking any endpoint-related change complete:
 - [ ] `src/mcpHandler.ts` exposes matching parameters and an accurate description
 - [ ] `docs/src/` Jsonnet/Markdown reflects the change
 - [ ] `docs/openapi.yaml` has been regenerated (`npm run build-docs`)
+- [ ] `README.md`'s table of contents has been regenerated if headings changed (`npm run build-toc`)
+- [ ] `publicApi.d.ts`/`publicApi.js` have been regenerated if `src/publicApi.ts` changed (`npm run build-types`)
 - [ ] Unit tests in `src/requestHandler.test.ts` and/or `src/mcpHandler.test.ts` cover the changed behavior
 - [ ] Integration tests in `src/integration/` cover the changed behavior
 
@@ -93,13 +150,25 @@ Releases are performed on the `main` branch after all feature branches have been
 
    Before proceeding, read the current version from `package.json`. Ask the user whether this is a **major**, **minor**, or **patch** bump and calculate the new version number from their answer — do not ask them to supply the version number directly.
 
-2. Delete `package-lock.json` and regenerate it:
+2. Edit the `version` field in `package.json` to the new version number.
+
+3. Delete `node_modules` **and** `package-lock.json`, then regenerate the lockfile:
    ```
-   rm package-lock.json
+   rm -rf node_modules package-lock.json
    npm i
    ```
 
-3. Edit the `version` field in `package.json` to the new version number.
+   Obsidian's post-release source review rejects a release whose lockfile it cannot install from with "The npm lockfile is out of date". Two mistakes have caused that:
+
+   - **Leaving `node_modules` in place.** npm then builds the new lockfile from what is already installed, and records only the optional platform-specific packages for *this* machine — e.g. one `@esbuild/*` binary instead of all of them. npm 10 tolerates the gap, but npm 11's `npm ci` rejects it with `Missing: @esbuild/... from lock file` (5.5.0 and 5.5.1 shipped that way).
+   - **Regenerating before the version bump in step 2.** `package-lock.json` records the package's own version and nothing else in this process updates it (5.4.0 and 5.5.0 shipped naming the previous version).
+
+   Before moving on, confirm the lockfile agrees with `package.json`, then do a clean install with npm 11 specifically, since a passing `npm ci` under npm 10 does not prove the lockfile is complete:
+   ```
+   node -e 'const p=require("./package.json"),l=require("./package-lock.json");if(p.version!==l.version||p.version!==l.packages[""].version)throw new Error(`lockfile is ${l.version}, package.json is ${p.version}`)'
+   rm -rf node_modules
+   npx -y npm@11 ci
+   ```
 
 4. Run the version script to update `manifest.json` and `versions.json` (this also stages those two files automatically):
    ```
@@ -137,3 +206,17 @@ Releases are performed on the `main` branch after all feature branches have been
    - Credit external contributors where relevant (e.g. `Thanks @username!`). GitHub handles are not present in commit messages — look them up via `gh pr view <number>` for any PR-sourced changes.
    - Sub-bullets may be used for multi-part changes.
    - For re-releases (e.g. fixing a botched release), add a short prose paragraph before or after the bullets explaining what changed from the prior release attempt and that the underlying content is otherwise identical.
+
+8. After pushing the tag, check whether the extension API changed since the previous release:
+
+   ```
+   git diff <previous-tag> HEAD -- src/publicApi.ts publicApi.d.ts publicApi.js package.json
+   ```
+
+   If it did, **remind the user to publish the types package to npm** — the same `obsidian-local-rest-api` package extension authors install for `publicApi.d.ts` typings. Publishing is a manual step the user must perform themselves; their npm authentication setup means it cannot run in CI and cannot be performed by an assistant. Suggest they run:
+
+   ```
+   npm publish
+   ```
+
+   (`npm publish --dry-run` first shows exactly what will ship; package.json's `files` whitelist limits it to the generated `publicApi.js`/`publicApi.d.ts` plus manifest, Readme, and license.)

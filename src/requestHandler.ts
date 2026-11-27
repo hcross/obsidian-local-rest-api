@@ -4,21 +4,41 @@ import {
   PluginManifest,
   TFile,
 } from "obsidian";
-import { posix } from "path";
 import forge from "node-forge";
 
 import express from "express";
 import http from "http";
-import cors from "cors";
+import cors, { CorsOptions } from "cors";
+import rateLimit, { MemoryStore, type RateLimitInfo } from "express-rate-limit";
 import mime from "mime-types";
 import responseTime from "response-time";
 import queryString from "query-string";
 import {
+  FrontmatterParseError,
   getDocumentMap,
   PatchFailed,
   PatchOperation,
 } from "markdown-patch";
-import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ContentPreexistsError,
+  InvalidCellError,
+  InvalidCellContentError,
+  InvalidInstructionError,
+  PreconditionFailedError,
+  TargetNotFoundError,
+  FrontmatterParseError as FrontmatterParseErrorV2,
+  FrontmatterKeyCollisionError,
+  ReservedDuplicateMarkerError,
+  InstructionInputSchema,
+  readTarget,
+  versionOf,
+} from "markdown-patch-2";
+import type {
+  InstructionInput,
+  PublicMap,
+  ReadTarget,
+} from "markdown-patch-2";
+import { SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/server";
 
 import {
   CannedResponse,
@@ -27,68 +47,177 @@ import {
   ErrorResponseDescriptor,
   FileMetadataObject,
   LocalRestApiSettings,
-  PeriodicNoteInterface,
   SearchJsonResponse,
 } from "./types";
 import {
-  getCertificateIsUptoStandards,
-  getCertificateValidityDays,
+  constantTimeEquals,
 } from "./utils";
+import {
+  formatEntityTag,
+  parseEntityTagCondition,
+  WritePreconditions,
+} from "./conditionalRequests";
+import {
+  getCertificateStandardsIssue,
+  getCertificateValidityDays,
+} from "./certificates";
 import {
   CERT_NAME,
   ContentTypes,
   ERROR_CODE_MESSAGES,
+  MCP_SESSIONLESS_PROTOCOL_VERSION,
   MaximumRequestSize,
+  AuthenticationFailureLimit,
+  AuthenticationFailureWindowMs,
 } from "./constants";
 import {
   isContentType,
   isPatchOperation,
   isPatchTargetScope,
   isPatchTargetType,
+  isV2Operation,
+  isV2ReadScope,
+  isV2Scope,
+  isV2TargetType,
 } from "./typeGuards";
-import LocalRestApiPublicApi from "./api";
+import LocalRestApiPublicApiImpl from "./api";
+import { OpenApiSpec } from "./openApiSpec";
+import type { LocalRestApiPublicApi } from "./publicApi";
 import {
   CommandNotFoundError,
   DestinationAlreadyExistsError,
   FileNotFoundError,
   VaultOperations,
 } from "./vaultOperations";
+import {
+  PathTraversalError,
+  ConfigDirAccessError,
+  vaultPathIsContained,
+  onDiskAccessFor,
+  vaultPathIsInConfigDir,
+} from "./vaultPath";
 import { McpHandler } from "./mcpHandler";
 import { AuditLogger } from "./auditLogger";
 import { sanitizeError } from "./errorUtils";
+import { MetadataCacheObserver, StateRegistry, clampStateReadTimeout } from "./serverState";
+import { VaultSubresourceRegistry } from "./vaultSubresources";
+import {
+  UrlSigner,
+  clampSignedUrlTtl,
+  eventStreamResource,
+  isSignableMethod,
+  normalizeVaultFilePath,
+  requestBaseUrl,
+  type SignatureVerdict,
+} from "./signedUrls";
+import {
+  EventStreams,
+  InvalidEventFilterError,
+  TooManyStreamsError,
+  TooManySubscriptionsError,
+} from "./events";
 
 // Import openapi.yaml as a string
 import openapiYaml from "../docs/openapi.yaml";
 
-// --- In-memory rate limiting for authentication failures (H-04) ---
-interface FailureRecord { count: number; lockedUntil?: number; }
-const authFailures = new Map<string, FailureRecord>();
-const MAX_FAILURES = 5;
-const COOLDOWN_MS = 30_000;
+/** The header that selects which markdown-patch format a request speaks. */
+export const MARKDOWN_PATCH_VERSION_HEADER = "Markdown-Patch-Version";
 
-function checkRateLimit(ip: string): void {
-  const now = Date.now();
-  const record = authFailures.get(ip) ?? { count: 0 };
-  if (record.lockedUntil && now < record.lockedUntil) {
-    const retryAfter = Math.ceil((record.lockedUntil - now) / 1000);
-    throw Object.assign(new Error("Too many failed attempts"), { statusCode: 429, retryAfter });
-  }
+// Per-request state this handler attaches to the request. Kept off `res.locals` and on
+// the request itself so the handlers, which receive the request, can read it without a
+// cast at every site.
+interface RequestState {
+  signedUrl?: boolean;
+  /** The signer's verdict on this request, computed once; `null` when it carries no signature. */
+  signedUrlVerdict?: SignatureVerdict | null;
+}
+/**
+ * Blank the credential-bearing parts of a URL for logging.
+ *
+ * `sig` and `n` are a bearer capability: anyone holding them can redeem the link until
+ * it expires, without the API key. Verbose logging wrote the whole URL to the developer
+ * console, and console output is the sort of thing that ends up pasted into a bug report.
+ * The expiry is left legible because it is useful when reading a log and grants nothing
+ * on its own.
+ */
+export function redactSignedUrl(url: string): string {
+  return url.replace(/([?&](?:sig|n)=)[^&#]*/gi, "$1<redacted>");
 }
 
-function recordAuthFailure(ip: string): void {
-  const record = authFailures.get(ip) ?? { count: 0 };
-  record.count += 1;
-  if (record.count >= MAX_FAILURES) {
-    record.lockedUntil = Date.now() + COOLDOWN_MS;
-    record.count = 0;
-  }
-  authFailures.set(ip, record);
+function res_locals(req: express.Request): RequestState {
+  const carrier = req as express.Request & { localRestApi?: RequestState };
+  carrier.localRestApi ??= {};
+  return carrier.localRestApi;
 }
 
-function recordAuthSuccess(ip: string): void {
-  authFailures.delete(ip);
+/** The `sunset-version` advertised for the deprecated 1.x format (RFC 8594). */
+export const MARKDOWN_PATCH_V1_SUNSET = "6.0";
+
+/**
+ * Percent-encodes a vault-relative path for a `Content-Location` response header.
+ *
+ * `encodeURI` is not enough: it deliberately leaves URI delimiters alone, so a
+ * perfectly legal vault filename containing `#`, `?` or `,` would come back
+ * verbatim. `Content-Location: notes/a#b.md` parses as the path `notes/a` plus
+ * the fragment `b.md`, and a comma is a header-list separator -- in both cases
+ * the client reads a different filename than the one the request acted on.
+ *
+ * Each segment is encoded on its own and the separators are re-joined, which is
+ * exactly the rule the request side documents for URL path targeting: a real `/`
+ * separates path components, and anything else inside a component is encoded.
+ * That makes the header safe to paste straight back into a request URL.
+ */
+export function encodeVaultPath(path: string): string {
+  return path.split("/").map(encodeURIComponent).join("/");
 }
-// ------------------------------------------------------------------
+
+/**
+ * CORS options shared by the main API router and the MCP router.
+ *
+ * `exposedHeaders: "*"` is what lets a browser client read any of the response
+ * headers this API sets to tell it something -- `Content-Location`, `Deprecation`,
+ * `Markdown-Patch-Warnings`, `Content-Disposition`, `ETag`, `Total-Results`,
+ * `X-Response-Time`, and `Mcp-Session-Id`. Without it the `cors` package omits Access-Control-Expose-Headers
+ * altogether and only the seven CORS-safelisted headers are readable from JavaScript.
+ *
+ * The wildcard is used rather than an enumerated list so a header added later cannot
+ * be forgotten here. Two caveats come with it, and both are satisfied today:
+ *
+ * - Per the Fetch standard the wildcard is only special for requests made *without*
+ *   credentials; in a credentialed request it is read as the literal header name `*`.
+ *   This API never sends `Access-Control-Allow-Credentials`, so a credentialed request
+ *   cannot succeed here. Should the origin policy ever gain credentials, this must
+ *   become an explicit list at the same time.
+ * - Safari only honoured the wildcard from 15.4 (March 2022). Older clients fall back
+ *   to the safelist -- no worse off than before this was set.
+ *
+ * The `CorsOptions` annotation is load-bearing rather than decorative: `cors()` accepts
+ * any object structurally, so an untyped literal would take `exposeHeaders` or
+ * `exposedHeader` without complaint and silently drop back to the safelist. Annotated,
+ * a misspelled key is a typecheck error -- which is the only place a mistake here can
+ * be caught, since a wrong key produces no runtime error, just a missing header.
+ */
+const corsOptions: CorsOptions = {
+  // Restrict to the origins Obsidian itself uses (compliance baseline: no wildcard origin).
+  origin: ["app://obsidian.md", "capacitor://localhost", "http://localhost"],
+  methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE", "COPY"],
+  exposedHeaders: "*",
+};
+
+/**
+ * Resolve which markdown-patch engine a request selects via the
+ * {@link MARKDOWN_PATCH_VERSION_HEADER} header. The 2.0 format is the default:
+ * an absent header or an explicit `"2"` selects it; `"1"` opts back into the
+ * deprecated header-driven format; any other value is invalid (`null`).
+ */
+export function resolvePatchVersion(
+  req: express.Request,
+): 1 | 2 | null {
+  const raw = req.get(MARKDOWN_PATCH_VERSION_HEADER);
+  if (raw === undefined || raw === "2") return 2;
+  if (raw === "1") return 1;
+  return null;
+}
 
 export default class RequestHandler {
   app: App;
@@ -98,28 +227,62 @@ export default class RequestHandler {
 
   apiExtensionRouter: express.Router;
   publicApiExtensionRouter: express.Router;
-  apiExtensions: Map<string, { manifest: PluginManifest; api: LocalRestApiPublicApi }> = new Map();
+  /**
+   * The failed-authentication throttle's counter. The library's store sweeps expired
+   * windows on an interval, which `dispose` stops so a plugin reload leaves nothing
+   * behind.
+   */
+  private authenticationFailureStore: MemoryStore | null = null;
+  vaultSubresources = new VaultSubresourceRegistry();
+  // Holds the implementation type rather than LocalRestApiPublicApi: the `GET /`
+  // handler reads getRoutes()/getMcpTools(), which are host-only and therefore
+  // absent from the published interface. registerApiExtension still hands
+  // extensions the narrower interface.
+  apiExtensions: Map<string, { manifest: PluginManifest; api: LocalRestApiPublicApiImpl }> = new Map();
 
   operations: VaultOperations;
+  events: EventStreams;
   mcpHandler: McpHandler;
   auditLogger: AuditLogger;
+  // The host's own contribution to the `state` section of `GET /`, and the extensions'.
+  readonly metadataCacheObserver: MetadataCacheObserver;
+  readonly stateRegistry = new StateRegistry();
+  // One signer per handler, so the MCP tools that mint links and the REST middleware
+  // that redeems them share a secret — and that secret lives exactly as long as this
+  // handler does.
+  readonly urlSigner: UrlSigner;
+  // The spec served at /openapi.yaml, /openapi.json, and the MCP openapi-spec resource:
+  // the host's compiled spec plus whatever registered extensions have described.
+  readonly openApiSpec: OpenApiSpec;
 
   constructor(
     app: App,
     manifest: PluginManifest,
     settings: LocalRestApiSettings,
+    urlSigner: UrlSigner = new UrlSigner(),
   ) {
     this.app = app;
     this.manifest = manifest;
     this.api = express();
     this.settings = settings;
+    this.urlSigner = urlSigner;
+    this.openApiSpec = new OpenApiSpec(openapiYaml);
 
     this.apiExtensionRouter = express.Router();
     this.publicApiExtensionRouter = express.Router();
-    this.operations = new VaultOperations(this.app);
-    this.mcpHandler = new McpHandler(this.operations, this.settings);
+    this.operations = new VaultOperations(this.app, this.settings);
     const vaultPath = (this.app.vault.adapter as { basePath?: string }).basePath ?? "";
     this.auditLogger = new AuditLogger(vaultPath);
+    this.events = new EventStreams(this.app, this.operations);
+    this.metadataCacheObserver = new MetadataCacheObserver(this.app.metadataCache);
+    this.mcpHandler = new McpHandler(this.operations, this.settings, {
+      signer: this.urlSigner,
+      events: this.events,
+      openApiSpec: this.openApiSpec,
+      // Not called until a client reads the resource, by which time this handler is
+      // fully constructed.
+      serverStatus: () => this.serverStatus(true),
+    });
 
     this.api.set("json spaces", 2);
   }
@@ -140,26 +303,156 @@ export default class RequestHandler {
         parent.stack.splice(idx, 1);
       }
     };
-    const api = new LocalRestApiPublicApi(router, publicRouter, this.mcpHandler, () => {
-      if (this.apiExtensions.delete(manifest.id)) {
+    const api = new LocalRestApiPublicApiImpl(
+      router,
+      publicRouter,
+      this.mcpHandler,
+      this.vaultSubresources,
+      this.openApiSpec,
+      manifest.id,
+      () => {
+        // A handle unregistered a second time, after a new one was registered for the
+        // same plugin, must not take the new one's routes and events down with it.
+        if (this.apiExtensions.get(manifest.id)?.api !== api) return;
+        this.apiExtensions.delete(manifest.id);
         removeRouter(this.apiExtensionRouter, router);
         removeRouter(this.publicApiExtensionRouter, publicRouter);
-      }
-    });
+        this.events.removeExtensionEvents(manifest.id);
+      },
+      (event, definition) => this.events.addExtensionEvent(manifest.id, event, definition),
+      (definition) => this.stateRegistry.add(manifest.id, definition),
+    );
     this.apiExtensions.set(manifest.id, { manifest, api });
 
     return api;
   }
 
-  requestIsAuthenticated(req: express.Request): boolean {
-    const authorizationHeader = req.get(
-      this.settings.authorizationHeaderName ?? "Authorization",
-    );
-    if (authorizationHeader === `Bearer ${this.settings.apiKey}`) {
-      return true;
-    }
+  /** The header this server reads its bearer token from, as the request sent it. */
+  private authorizationHeader(req: express.Request): string | undefined {
+    return req.get(this.settings.authorizationHeaderName ?? "Authorization");
+  }
 
-    return false;
+  requestIsAuthenticated(req: express.Request): boolean {
+    const presented = this.authorizationHeader(req);
+    if (presented === undefined) return false;
+    // Constant-time: `===` would let response timing reveal how much of a
+    // guessed key was right. Whether a header was sent at all is not secret.
+    return constantTimeEquals(presented, `Bearer ${this.settings.apiKey}`);
+  }
+
+  /**
+   * Whether a request carries a valid signed-URL signature for its own path.
+   *
+   * Only `GET` and `PUT` on `/vault/<file>`, and `GET` on an event stream
+   * (`/events/<emitter>/<event>/<id>/`), are signable, and only while the setting is
+   * on. A vault path is decoded the way {@link extractVaultPath} decodes it and normalized
+   * the way the signer normalized it, so the signature covers exactly the file the
+   * request resolves to. Returns null when the request carries no signature at all;
+   * otherwise the signer's verdict.
+   */
+  private signedUrlVerdict(req: express.Request): SignatureVerdict | null {
+    // Verifying is an HMAC, and the throttle asks the question before the
+    // authentication middleware does, so the answer is computed once per request.
+    const state = res_locals(req);
+    if (state.signedUrlVerdict === undefined) {
+      state.signedUrlVerdict = this.computeSignedUrlVerdict(req);
+    }
+    return state.signedUrlVerdict;
+  }
+
+  private computeSignedUrlVerdict(req: express.Request): SignatureVerdict | null {
+    const { sig, exp, n } = req.query;
+    // `sig` and `exp` together are what makes this *look* like a signed request; without
+    // them it is an ordinary one and falls through to API-key auth, so the absence of
+    // either returns null rather than a rejection. A missing or malformed `n` is a
+    // different thing -- the request claims to be signed and cannot be -- so it is left
+    // to `verify`, which rejects it as invalid along with every other bad signature.
+    if (typeof sig !== "string" || typeof exp !== "string") return null;
+    const nonce = typeof n === "string" ? n : "";
+    if (!this.settings.enableSignedUrls) return "invalid";
+    // An event stream's URL is signed over its whole path; the subscription it names
+    // carries the filter, so nothing else about the request needs covering.
+    const stream = /^\/events\/([^/]+)\/([^/]+)\/([^/]+)\/?$/.exec(req.path);
+    if (stream) {
+      if (req.method !== "GET") return "invalid";
+      const [, emitter, event, id] = stream;
+      return this.urlSigner.verifyEventStream(
+        eventStreamResource(emitter, event, id),
+        exp,
+        sig,
+        nonce,
+      );
+    }
+    if (!isSignableMethod(req.method) || !req.path.startsWith("/vault/")) return "invalid";
+    let decoded: string;
+    try {
+      decoded = req.path
+        .slice("/vault/".length)
+        .split("/")
+        .map((segment) => decodeURIComponent(segment))
+        .join("/");
+    } catch {
+      return "invalid";
+    }
+    if (normalizeVaultFilePath(decoded) === null) return "invalid";
+    // Verification folds `\` into `/` (normalizeVaultFilePath treats it as a separator,
+    // for Windows-shaped input); dispatch does not -- `wholeFilePath` only rejects a
+    // segment containing `/` and joins the rest verbatim. So a signature minted for `a/b`
+    // also verifies for `a%5Cb`, and the two layers disagree about which file that names.
+    //
+    // In practice Obsidian normalizes the separator again before the write lands, which
+    // is why a redeemed `a%5Cb` was observed writing to `a/b` rather than to a distinct
+    // file. That is somebody else's implementation detail to change, though, and a signed
+    // URL should not depend on it to name the right file. A signed request carrying a
+    // backslash is refused instead: no legitimate link needs one, because `sign`
+    // normalized the separator away before signing.
+    if (decoded.includes("\\")) return "invalid";
+    return this.urlSigner.verify(req.method, decoded, exp, sig, nonce);
+  }
+
+  /** True when the request was authenticated by a signed URL rather than the API key. */
+  requestIsSigned(req: express.Request): boolean {
+    return res_locals(req).signedUrl === true;
+  }
+
+  /**
+   * Whether the request presents a credential that does not check out.
+   *
+   * This is what the failed-authentication throttle counts and, past the limit,
+   * refuses. A request with the correct API key or a valid signed URL is not a failure;
+   * neither is one that presents nothing at all, because it has made no guess -- it is
+   * answered 401 (or, on the exempt routes, served) exactly as before, however many of
+   * them arrive. Only a request that offers a key or a signature, and offers a wrong one,
+   * counts. That includes a wrong key sent to `GET /`, which answers 200 either way and
+   * would otherwise be the cheapest oracle on the server.
+   *
+   * The answer only means anything on a route that would check the credential, which is
+   * why the limiter sits exactly where those checks sit (see `setupRouter`) and not in
+   * front of an extension's public routes, where a header or `sig`/`exp` pair belongs to
+   * the extension and is no guess against this key.
+   */
+  private credentialIsRejected(req: express.Request): boolean {
+    if (this.requestIsAuthenticated(req)) return false;
+    const verdict = this.signedUrlVerdict(req);
+    if (verdict === "ok") return false;
+    if (verdict !== null) return true;
+    return this.authorizationHeader(req) !== undefined;
+  }
+
+  /**
+   * Release everything the handler keeps running in the background: open MCP
+   * transports, the vault listeners behind the backlinks cache, every event stream and
+   * its listeners, the metadata-cache observer behind `GET /`'s `state`, and the
+   * throttle store's sweep interval. The plugin calls this once on unload, so that a
+   * reload leaves nothing behind; the handler is not reusable after.
+   */
+  dispose(): void {
+    this.mcpHandler.close();
+    this.operations.dispose();
+    this.events.dispose();
+    this.metadataCacheObserver.dispose();
+    this.authenticationFailureStore?.shutdown();
+    this.authenticationFailureStore = null;
   }
 
   async authenticationMiddleware(
@@ -171,47 +464,79 @@ export default class RequestHandler {
       "/",
       `/${CERT_NAME}`,
       "/openapi.yaml",
+      "/openapi.json",
     ];
 
-    if (!authenticationExemptRoutes.includes(req.path)) {
-      const ip = req.ip ?? req.socket.remoteAddress ?? "unknown";
+    if (authenticationExemptRoutes.includes(req.path) || this.requestIsAuthenticated(req)) {
+      next();
+      return;
+    }
 
-      // Check rate limit before evaluating the token
-      try {
-        checkRateLimit(ip);
-      } catch (err) {
-        const e = err as { statusCode?: number; retryAfter?: number };
-        if (e.statusCode === 429) {
-          res.set("Retry-After", String(e.retryAfter ?? 30));
-          this.returnCannedResponse(res, {
-            statusCode: 429,
-            message: (err as Error).message,
-          });
-          return;
-        }
-        throw err;
-      }
-
-      if (!this.requestIsAuthenticated(req)) {
-        recordAuthFailure(ip);
+    // A signed URL stands in for the bearer header on the one request it names. A PUT
+    // link is spent by the first request that succeeds with it, so the same link
+    // cannot overwrite the file twice.
+    const verdict = this.signedUrlVerdict(req);
+    if (verdict === "ok") {
+      const { sig, exp } = req.query as { sig: string; exp: string };
+      // Claim the link here, before dispatch, rather than recording it as spent once the
+      // response finishes. The old ordering left the whole request between the check and
+      // the record, so concurrent PUTs each verified against a link none of them had yet
+      // taken: six at once produced four successful writes of a link documented as
+      // single-use. Claiming is atomic because nothing awaits between `verify` above and
+      // this call.
+      if (!this.urlSigner.claim(req.method, exp, sig)) {
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.ApiKeyAuthorizationRequired,
+          message: "The signed upload URL has already been used.",
         });
         return;
       }
-
-      recordAuthSuccess(ip);
+      res_locals(req).signedUrl = true;
+      // Give it back unless the request actually succeeded. `close` rather than `finish`
+      // so an aborted connection -- which never fires `finish` -- releases too, instead
+      // of stranding a link that was never redeemed.
+      res.on("close", () => {
+        const succeeded =
+          res.writableEnded && res.statusCode >= 200 && res.statusCode < 300;
+        if (!succeeded) this.urlSigner.release(req.method, sig);
+      });
+      next();
+      return;
+    }
+    if (verdict !== null) {
+      const reason = {
+        expired: "The signed URL has expired.",
+        consumed: "The signed upload URL has already been used.",
+        invalid: "The signed URL is not valid for this request.",
+      }[verdict];
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ApiKeyAuthorizationRequired,
+        message: reason,
+      });
+      return;
     }
 
-    next();
+    this.returnCannedResponse(res, {
+      errorCode: ErrorCode.ApiKeyAuthorizationRequired,
+    });
   }
 
   async getDocumentMapObject(file: TFile): Promise<DocumentMapObject> {
     return this.operations.getDocumentMapObject(file);
   }
 
+  async getDocumentMapV2Object(file: TFile): Promise<PublicMap> {
+    return this.operations.getDocumentMapV2Object(file);
+  }
+
   async getFileMetadataObject(file: TFile): Promise<FileMetadataObject> {
     return this.operations.getFileMetadataObject(file);
+  }
+
+  async renderFileToHtml(file: TFile, content?: string): Promise<string> {
+    return content !== undefined
+      ? this.operations.renderFileToHtml(file, content)
+      : this.operations.renderFileToHtml(file);
   }
 
   getResponseMessage({
@@ -256,7 +581,19 @@ export default class RequestHandler {
     res.status(this.getStatusCode({ statusCode, errorCode })).json(response);
   }
 
-  root(req: express.Request, res: express.Response): void {
+  async root(req: express.Request, res: express.Response): Promise<void> {
+    res.status(200).json(await this.serverStatus(this.requestIsAuthenticated(req)));
+  }
+
+  /**
+   * The `GET /` document, which the MCP `server-status` resource also serves.
+   *
+   * `certificateInfo`, `apiExtensions`, and `state` are withheld from an
+   * unauthenticated caller: `GET /` is the one route that answers without the API key,
+   * and these three describe the installation, the plugins in it, and when its owner
+   * was last active. An extension that wants a public signal has `addPublicRoute`.
+   */
+  async serverStatus(authenticated: boolean): Promise<Record<string, unknown>> {
     let certificate: forge.pki.Certificate | undefined;
     try {
       if (this.settings.crypto?.cert) {
@@ -266,7 +603,11 @@ export default class RequestHandler {
       // This is fine, we just won't include that in the output
     }
 
-    res.status(200).json({
+    const standardsIssue = certificate
+      ? getCertificateStandardsIssue(certificate)
+      : null;
+
+    return {
       status: "OK",
       manifest: this.manifest,
       versions: {
@@ -274,68 +615,247 @@ export default class RequestHandler {
         self: this.manifest.version,
       },
       service: "Obsidian Local REST API",
-      authenticated: this.requestIsAuthenticated(req),
+      authenticated,
       certificateInfo:
-        this.requestIsAuthenticated(req) && certificate
+        authenticated && certificate
           ? {
             validityDays: getCertificateValidityDays(certificate),
-            regenerateRecommended:
-              !getCertificateIsUptoStandards(certificate),
+            regenerateRecommended: standardsIssue !== null,
+            regenerateReason: standardsIssue,
           }
           : undefined,
-      apiExtensions: this.requestIsAuthenticated(req)
+      apiExtensions: authenticated
         ? [...this.apiExtensions.values()].map(({ manifest, api }) => ({
           ...manifest,
           routes: api.getRoutes(),
           mcpTools: api.getMcpTools(),
         }))
         : undefined,
+      state: authenticated
+        ? {
+          metadataCache: this.metadataCacheObserver.snapshot(),
+          ...(await this.stateRegistry.collect(
+            clampStateReadTimeout(this.settings.stateReadTimeoutMs),
+          )),
+        }
+        : undefined,
+    };
+  }
+
+  /** The vault path from the request, split into decoded segments.
+   *
+   *  `req.path` is the raw, still-encoded path, so it is split on its *real*
+   *  slashes and each segment is decoded individually. A `%2F` therefore stays a
+   *  literal `/` inside the one segment it belongs to (e.g. a heading named
+   *  "A/B") instead of re-forming a path boundary the way a decode-then-split
+   *  would. Returns null (and sends a 400) on malformed encoding or a path that
+   *  escapes the vault root. */
+  private extractVaultPath(
+    req: express.Request,
+    res: express.Response,
+  ): string[] | null {
+    const rawRemainder = req.path.slice(req.path.indexOf("/", 1) + 1);
+    let segments: string[];
+    try {
+      segments = rawRemainder.split("/").map((s) => decodeURIComponent(s));
+    } catch {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.PathTraversalNotAllowed });
+      return null;
+    }
+    // Traversal guard: refuse a ".." segment, an absolute path, and anything else
+    // that could leave the vault. Applied to the joined form so an encoded
+    // `..%2F..%2F…` — which arrives as a single segment — is still caught after
+    // decoding. See ./vaultPath for the containment rule itself.
+    if (!vaultPathIsContained(segments.join("/"))) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.PathTraversalNotAllowed });
+      return null;
+    }
+    // Config-directory guard: a path inside Obsidian's config dir is refused unless
+    // the operator opted in. Writing there is code execution and reading there leaks
+    // secrets (GHSA-66m9-r757-qvq7). VaultOperations enforces this again before any
+    // filesystem access; this is the early, well-shaped rejection at the boundary.
+    if (
+      !this.settings.enableConfigDirAccess &&
+      this.pathIsInConfigDir(segments.join("/"))
+    ) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ConfigDirAccessNotAllowed,
+      });
+      return null;
+    }
+    return segments;
+  }
+
+  /** Let a refusal from the authorization gate out of an endpoint-local catch.
+   *
+   *  Those catches map the errors their operation is known to throw -- not
+   *  found, patch failed -- and answer anything else with a 500 or a coarse
+   *  client error. A PathTraversalError or ConfigDirAccessError is neither: it
+   *  is the gate in VaultOperations refusing a path the boundary never saw
+   *  (`/active/` takes its path from the workspace, not the client), and it has
+   *  to reach `errorHandler`, which answers it with the policy's own status and
+   *  error code. Called first in any catch that would otherwise swallow it. */
+  private rethrowIfRefused(error: unknown): void {
+    if (error instanceof PathTraversalError || error instanceof ConfigDirAccessError) {
+      throw error;
+    }
+  }
+
+  /**
+   * The request's `If-Match`/`If-None-Match` headers, for a write to check
+   * against the file's current version. Returns null -- having already sent a
+   * 400 -- when either header is malformed, since guessing at a precondition a
+   * client meant to protect itself with would defeat the point of sending one.
+   */
+  private requestPreconditions(
+    req: express.Request,
+    res: express.Response,
+  ): WritePreconditions | null {
+    const preconditions: WritePreconditions = {};
+    for (const [header, key] of [
+      ["If-Match", "ifMatch"],
+      ["If-None-Match", "ifNoneMatch"],
+    ] as const) {
+      const raw = req.get(header);
+      if (raw === undefined) continue;
+      const condition = parseEntityTagCondition(raw);
+      if (condition === null) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidPreconditionHeader,
+          message: `It was supplied in the '${header}' header.`,
+        });
+        return null;
+      }
+      preconditions[key] = condition;
+    }
+    return preconditions;
+  }
+
+  /** Answer 412 for a write whose precondition did not hold. */
+  private returnPreconditionFailed(
+    res: express.Response,
+    error: PreconditionFailedError,
+  ): void {
+    this.returnCannedResponse(res, {
+      errorCode: ErrorCode.PreconditionFailed,
+      message: error.message,
     });
   }
 
+  /** Whether a contained, vault-relative path is Obsidian's configuration
+   *  directory or inside it -- by spelling, and by where it lands on disk, so an
+   *  NTFS 8.3 short name or a symlink cannot reach it under another name. */
+  private pathIsInConfigDir(candidate: string): boolean {
+    return vaultPathIsInConfigDir(
+      candidate,
+      this.app.vault.configDir,
+      onDiskAccessFor(this.app.vault.adapter),
+    );
+  }
+
+  /** Join decoded segments into a whole-file path, or null when a segment holds
+   *  a literal `/` (a decoded `%2F`). A file or folder name can never contain a
+   *  slash, so such a segment can only belong to a target address — this is what
+   *  stops `folder%2Fnote.md` (one segment "folder/note.md") from resolving as a
+   *  file. A trailing empty segment (a trailing slash) is preserved so the
+   *  whole-file handlers still reject a directory path. */
+  private wholeFilePath(segments: string[]): string | null {
+    if (segments.some((segment) => segment.includes("/"))) return null;
+    return segments.join("/");
+  }
+
+  /** The wildcard suffix of an `/active/*` route, split into
+   *  decoded segments. Express decodes the `req.params[0]` wildcard capture
+   *  before the handler runs — collapsing a `%2F` to a boundary — so the raw
+   *  suffix is recovered from `req.path` (still encoded) and each segment decoded
+   *  individually, mirroring {@link extractVaultPath}. The static prefix length
+   *  comes from the matched route pattern. Returns null (and sends a 400) on
+   *  malformed encoding. */
+  private rawSuffixSegments(
+    req: express.Request,
+    res: express.Response,
+  ): string[] | null {
+    const route = req.route as { path?: string } | undefined;
+    const routePath = route?.path ?? "";
+    // The pattern ends in the `*` wildcard; every earlier segment is static
+    // prefix. Dropping that many leading segments of the raw path leaves the
+    // still-encoded suffix.
+    const prefixLength = routePath.split("/").length - 1;
+    const rawSegments = req.path
+      .split("/")
+      .slice(prefixLength)
+      .filter((segment) => segment.length > 0);
+    try {
+      return rawSegments.map((segment) => decodeURIComponent(segment));
+    } catch {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.PathTraversalNotAllowed });
+      return null;
+    }
+  }
+
   async _vaultGet(
-    path: string,
+    segments: string[],
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    // Step 1: Normalize trailing slash
-    const normalizedPath = path.endsWith("/") ? path.slice(0, -1) : path;
+    // A whole-file or directory match only applies when the path can name one:
+    // a segment holding a literal "/" (a decoded %2F) never can, so such a path
+    // is a target address only (see wholeFilePath). Step 1: normalize trailing
+    // slash off the whole-file path.
+    const wholeFilePath = this.wholeFilePath(segments);
+    const normalizedPath =
+      wholeFilePath === null
+        ? null
+        : wholeFilePath.endsWith("/")
+          ? wholeFilePath.slice(0, -1)
+          : wholeFilePath;
 
     // Step 2: Exact file match (fast path)
-    let filePath = normalizedPath;
+    let filePath = normalizedPath ?? "";
     let urlTargetType: string | undefined;
     let urlTarget: string | undefined;
+    let urlTargetSegments: string[] | undefined;
 
     let exactStat = null;
-    try {
-      exactStat = normalizedPath
-        ? await this.app.vault.adapter.stat(normalizedPath)
-        : null;
-    } catch {
-      // ENOTDIR: a path segment is a file, not a directory — treat as no match.
+    if (normalizedPath !== null) {
+      try {
+        exactStat = normalizedPath
+          ? await this.operations.statPath(normalizedPath)
+          : null;
+      } catch (e) {
+        // A path the gate refuses (traversal, config dir) must fail closed, not be
+        // read as "no match" and fall through to a listing or a 404. Everything
+        // else here is ENOTDIR — a path segment is a file, not a directory — which
+        // is a genuine no-match.
+        if (e instanceof PathTraversalError || e instanceof ConfigDirAccessError) {
+          throw e;
+        }
+      }
     }
 
     if (!exactStat || exactStat.type !== "file") {
-      // Step 3: Directory listing check
-      const prefix = normalizedPath ? normalizedPath + "/" : "";
-      const hasChildren = this.app.vault
-        .getFiles()
-        .some((f) => f.path.startsWith(prefix));
+      // Step 3: Directory listing check (only when the path can be a directory).
+      if (normalizedPath !== null) {
+        const prefix = normalizedPath ? normalizedPath + "/" : "";
+        const hasChildren = this.app.vault
+          .getFiles()
+          .some((f) => f.path.startsWith(prefix));
 
-      if (!normalizedPath || hasChildren) {
-        const files = await this.operations.listVaultDirectory(normalizedPath);
+        if (!normalizedPath || hasChildren) {
+          const files = await this.operations.listVaultDirectory(normalizedPath);
 
-        if (files.length === 0 && normalizedPath) {
-          this.returnCannedResponse(res, { statusCode: 404 });
+          if (files.length === 0 && normalizedPath) {
+            this.returnCannedResponse(res, { statusCode: 404 });
+            return;
+          }
+
+          res.json({ files: files });
           return;
         }
-
-        res.json({ files: files });
-        return;
       }
 
       // Steps 4-5: Walk backward to find file + target (404 if nothing found)
-      const resolved = await this._resolvePathAndTarget(normalizedPath);
+      const resolved = await this._resolvePathAndTarget(segments);
       if (!resolved?.targetType) {
         this.returnCannedResponse(res, { statusCode: 404 });
         return;
@@ -343,15 +863,36 @@ export default class RequestHandler {
       filePath = resolved.filePath;
       urlTargetType = resolved.targetType;
       urlTarget = resolved.target;
+      urlTargetSegments = resolved.targetSegments;
+      // The URL did not name the file outright -- the resolver split it into a
+      // file plus a target. Say which file that turned out to be.
+      res.set("Content-Location", encodeVaultPath(filePath));
     }
 
-    const content = await this.app.vault.adapter.readBinary(filePath);
+    const content = await this.operations.readBinaryPath(filePath);
     const mimeType = mime.lookup(filePath);
 
+    // The file's version, as a strong entity tag. It is set only on the
+    // representations computed from the file's bytes alone -- the bytes
+    // themselves, a section of them, the document map -- because Express answers
+    // a matching If-None-Match with 304 on its own, and a note-JSON or HTML
+    // response also carries things that change while the bytes do not (backlinks,
+    // embeds). Those keep Express's default body-hash ETag; note JSON carries the
+    // version in its body instead.
+    const etag = formatEntityTag(versionOf(new Uint8Array(content)));
+
+    // A signed link is made to be opened — in a browser tab, in an <img> — so it is
+    // served inline unless the link asked for a download. API-key requests keep the
+    // attachment disposition they have always had.
+    const disposition =
+      this.requestIsSigned(req) && req.query.download !== "1" ? "inline" : "attachment";
     res.set({
-      "Content-Disposition": `attachment; filename="${encodeURI(
+      // Every comma, not just the first: a comma is a header-list separator, so one left
+      // unescaped splits the value. `replace` with a string argument replaces a single
+      // occurrence, which is what CodeQL's incomplete-sanitization rule caught here.
+      "Content-Disposition": `${disposition}; filename="${encodeURI(
         filePath,
-      ).replace(",", "%2C")}"`,
+      ).replaceAll(",", "%2C")}"`,
       "Content-Type":
         `${mimeType}` +
         (mimeType == ContentTypes.markdown ? "; charset=utf-8" : ""),
@@ -374,10 +915,43 @@ export default class RequestHandler {
         this.returnCannedResponse(res, { statusCode: 404 });
         return;
       }
+      // The document map defaults to the 2.0 shape (array heading addresses plus
+      // the `version` token); Markdown-Patch-Version: 1 returns the deprecated
+      // 1.x shape (`::`-joined heading paths, no version).
+      const version = resolvePatchVersion(req);
+      if (version === null) {
+        this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidPatchVersionHeader });
+        return;
+      }
       res.setHeader("Content-Type", ContentTypes.olrapiDocumentMap);
-      res.send(
-        JSON.stringify(await this.getDocumentMapObject(file), null, 2),
-      );
+      let mapJson: string;
+      try {
+        mapJson =
+          version === 1
+            ? JSON.stringify(await this.getDocumentMapObject(file), null, 2)
+            : JSON.stringify(await this.getDocumentMapV2Object(file), null, 2);
+      } catch (e) {
+        if (e instanceof FrontmatterParseError || e instanceof FrontmatterParseErrorV2) {
+          this.returnCannedResponse(res, {
+            errorCode: ErrorCode.InvalidFrontmatter,
+            message: e.message,
+          });
+          return;
+        }
+        if (e instanceof ReservedDuplicateMarkerError) {
+          this.returnCannedResponse(res, {
+            errorCode: ErrorCode.PatchFailed,
+            message: e.message,
+          });
+          return;
+        }
+        throw e;
+      }
+      if (version === 1) {
+        res.setHeader("Deprecation", `true; sunset-version="${MARKDOWN_PATCH_V1_SUNSET}"`);
+      }
+      res.setHeader("ETag", etag);
+      res.send(mapJson);
       return;
     }
 
@@ -388,14 +962,43 @@ export default class RequestHandler {
       return;
     }
 
+    const isHeaderTargeting = urlTargetType === undefined;
+
+    // Resolved v1 header-targeting (or untargeted) result, shared by the HTML
+    // render below and the default markdown/JSON response at the end.
+    let resolvedTarget:
+      | { targetType: "frontmatter"; value: unknown }
+      | { targetType: "heading" | "block"; content: string }
+      | undefined;
+
     const targetType = urlTargetType ?? req.get("Target-Type");
     if (targetType) {
       if (!["heading", "block", "frontmatter"].includes(targetType)) {
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.InvalidTargetTypeHeader,
+          message: isHeaderTargeting
+            ? "It was supplied in the 'Target-Type' header."
+            : `It was supplied as the URL path element '${targetType}', immediately after the note.`,
         });
         return;
       }
+
+      const version = resolvePatchVersion(req);
+      if (version === null) {
+        this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidPatchVersionHeader });
+        return;
+      }
+
+      // Header-based targeting is a deprecated 1.x feature: it is only processed
+      // under Markdown-Patch-Version: 1 (which carries the sunset advisory). Under
+      // the default (2.0), reach a sub-part with URL path elements instead.
+      if (isHeaderTargeting && version !== 1) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.HeaderTargetingRequiresVersion1,
+        });
+        return;
+      }
+
       let rawTarget = "";
       try {
         rawTarget =
@@ -416,8 +1019,91 @@ export default class RequestHandler {
       }
 
       const fileContent = Buffer.from(content).toString("utf-8");
-      const documentMap = getDocumentMap(fileContent);
       const targetDelimiter = req.get("Target-Delimiter") || "::";
+
+      if (version === 2) {
+        // v2 targeting is always path-based (header targeting is rejected above),
+        // so a heading is addressed array-natively via its URL path segments — no
+        // delimiter split that a heading containing `::` would otherwise break.
+        const address: ReadTarget =
+          targetType === "heading"
+            ? { targetType: "heading", target: urlTargetSegments ?? rawTarget.split(targetDelimiter) }
+            : targetType === "block"
+              ? { targetType: "block", target: rawTarget }
+              : { targetType: "frontmatter", target: rawTarget };
+
+        // Target-Scope narrows what comes back, mirroring the write scopes:
+        // reads and writes are tied by the round-trip guarantee (what a scope
+        // returns is what a `replace` at that scope consumes). `parent` places
+        // a section but carries no readable value, so it is not accepted here.
+        const rawScope = req.get("Target-Scope");
+        if (rawScope !== undefined) {
+          if (!isV2ReadScope(rawScope)) {
+            this.returnCannedResponse(res, {
+              errorCode: ErrorCode.InvalidTargetScopeHeader,
+              message:
+                "Valid values for a read are 'content', 'marker', and 'markerAndContent'.",
+            });
+            return;
+          }
+          address.scope = rawScope;
+        }
+        let result;
+        try {
+          result = readTarget(fileContent, address);
+        } catch (e) {
+          if (e instanceof TargetNotFoundError) {
+            this.returnCannedResponse(res, { statusCode: 404 });
+            return;
+          }
+          if (e instanceof FrontmatterParseErrorV2) {
+            this.returnCannedResponse(res, {
+              errorCode: ErrorCode.InvalidFrontmatter,
+              message: e.message,
+            });
+            return;
+          }
+          if (e instanceof ReservedDuplicateMarkerError) {
+            this.returnCannedResponse(res, {
+              errorCode: ErrorCode.PatchFailed,
+              message: e.message,
+            });
+            return;
+          }
+          throw e;
+        }
+
+        if ((req.headers.accept as ContentTypes) === ContentTypes.html) {
+          if (result.kind === "frontmatter") {
+            this.returnCannedResponse(res, {
+              errorCode: ErrorCode.InvalidTargetTypeHeader,
+            });
+            return;
+          }
+          const file = this.app.vault.getAbstractFileByPath(filePath);
+          if (!(file instanceof TFile)) {
+            this.returnCannedResponse(res, { statusCode: 404 });
+            return;
+          }
+          res.setHeader("Content-Type", ContentTypes.html + "; charset=utf-8");
+          res.send(await this.renderFileToHtml(file, result.content));
+          return;
+        }
+
+        res.setHeader("ETag", etag);
+        if (result.kind === "frontmatter") {
+          res.setHeader("Content-Type", ContentTypes.json);
+          res.json(result.value);
+        } else {
+          res.setHeader("Content-Type", ContentTypes.markdown + "; charset=utf-8");
+          res.send(result.content);
+        }
+        return;
+      }
+
+      // version === 1: deprecated 1.x header-driven extraction.
+      res.setHeader("Deprecation", `true; sunset-version="${MARKDOWN_PATCH_V1_SUNSET}"`);
+      const documentMap = getDocumentMap(fileContent);
 
       if (targetType === "frontmatter") {
         const value: unknown = documentMap.frontmatter[rawTarget];
@@ -425,34 +1111,62 @@ export default class RequestHandler {
           this.returnCannedResponse(res, { statusCode: 404 });
           return;
         }
-        res.setHeader("Content-Type", ContentTypes.json);
-        res.json(value);
-        return;
+        resolvedTarget = { targetType: "frontmatter", value };
+      } else {
+        const mapKey =
+          targetType === "heading"
+            ? rawTarget
+              .split(targetDelimiter)
+              .join("\u001f")
+            : rawTarget;
+
+        const entry =
+          targetType === "heading"
+            ? documentMap.heading[mapKey]
+            : documentMap.block[mapKey];
+
+        if (!entry) {
+          this.returnCannedResponse(res, { statusCode: 404 });
+          return;
+        }
+
+        resolvedTarget = {
+          targetType: targetType === "heading" ? "heading" : "block",
+          content: fileContent.substring(entry.content.start, entry.content.end),
+        };
       }
+    }
 
-      const mapKey =
-        targetType === "heading"
-          ? rawTarget
-            .split(targetDelimiter)
-            .join("\u001f")
-          : rawTarget;
-
-      const entry =
-        targetType === "heading"
-          ? documentMap.heading[mapKey]
-          : documentMap.block[mapKey];
-
-      if (!entry) {
+    if ((req.headers.accept as ContentTypes) === ContentTypes.html) {
+      const file = this.app.vault.getAbstractFileByPath(filePath);
+      if (!(file instanceof TFile)) {
         this.returnCannedResponse(res, { statusCode: 404 });
         return;
       }
-
-      const sectionContent = fileContent.substring(
-        entry.content.start,
-        entry.content.end,
+      if (resolvedTarget?.targetType === "frontmatter") {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidTargetTypeHeader,
+        });
+        return;
+      }
+      res.setHeader("Content-Type", ContentTypes.html + "; charset=utf-8");
+      res.send(
+        resolvedTarget
+          ? await this.renderFileToHtml(file, resolvedTarget.content)
+          : await this.renderFileToHtml(file),
       );
+      return;
+    }
+
+    res.setHeader("ETag", etag);
+    if (resolvedTarget) {
+      if (resolvedTarget.targetType === "frontmatter") {
+        res.setHeader("Content-Type", ContentTypes.json);
+        res.json(resolvedTarget.value);
+        return;
+      }
       res.setHeader("Content-Type", ContentTypes.markdown + "; charset=utf-8");
-      res.send(sectionContent);
+      res.send(resolvedTarget.content);
       return;
     }
 
@@ -460,22 +1174,21 @@ export default class RequestHandler {
   }
 
   async vaultGet(req: express.Request, res: express.Response): Promise<void> {
-    const path = decodeURIComponent(
-      req.path.slice(req.path.indexOf("/", 1) + 1),
-    );
-
-    return this._vaultGet(path, req, res);
+    const segments = this.extractVaultPath(req, res);
+    if (segments === null) return;
+    return this._vaultGet(segments, req, res);
   }
 
   /** Resolves a raw path (possibly containing a URL-embedded target) into a
    *  file path and optional target type + target string.  Returns null when no
    *  vault file can be found at any prefix of the path. */
-  async _resolvePathAndTarget(rawPath: string): Promise<{
+  async _resolvePathAndTarget(segments: string[]): Promise<{
     filePath: string;
     targetType?: string;
     target?: string;
+    targetSegments?: string[];
   } | null> {
-    return this.operations.resolvePathAndTarget(rawPath);
+    return this.operations.resolvePathAndTarget(segments);
   }
 
   /** Reads Target-Type / Target headers, validates them, and returns the
@@ -525,6 +1238,82 @@ export default class RequestHandler {
     return { targetType: rawTargetType, target };
   }
 
+  /** Parse the Target-Type/Target headers for a raw-content-mode PATCH.
+   *
+   *  Unlike the deprecated 1.x `_getHeaderTarget` (delimiter-joined strings),
+   *  the encoding here is type-dependent, mirroring the 2.0 instruction's
+   *  target shapes: a heading Target is percent-encoded JSON (an array of
+   *  heading texts, or `null` for the document root), while block and
+   *  frontmatter Targets are plain percent-encoded strings. Returns null when
+   *  an error response has already been sent. */
+  _getPatchHeaderTarget(
+    req: express.Request,
+    res: express.Response,
+  ): { targetType: string; target: string[] | string | null } | null {
+    const rawTargetType = req.get("Target-Type");
+    const rawTarget = req.get("Target");
+
+    if (!rawTargetType) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingTargetTypeHeader,
+      });
+      return null;
+    }
+    if (!isV2TargetType(rawTargetType)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidTargetTypeHeader,
+      });
+      return null;
+    }
+    if (!rawTarget) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingTargetHeader,
+      });
+      return null;
+    }
+
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(rawTarget);
+    } catch {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidTargetHeader,
+        message: "The 'Target' header could not be percent-decoded.",
+      });
+      return null;
+    }
+
+    if (rawTargetType === "heading") {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(decoded);
+      } catch {
+        parsed = undefined;
+      }
+      const isHeadingAddress =
+        parsed === null ||
+        (Array.isArray(parsed) &&
+          parsed.every((segment) => typeof segment === "string"));
+      if (parsed === undefined || !isHeadingAddress) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidTargetHeader,
+          message:
+            "A heading 'Target' header must be percent-encoded JSON: an array of heading texts (e.g. %5B%22A%22%2C%22B%22%5D) or null for the document root.",
+        });
+        return null;
+      }
+      return { targetType: rawTargetType, target: parsed as string[] | null };
+    }
+
+    if (!decoded) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingTargetHeader,
+      });
+      return null;
+    }
+    return { targetType: rawTargetType, target: decoded };
+  }
+
   async _vaultPut(
     filepath: string,
     req: express.Request,
@@ -536,21 +1325,33 @@ export default class RequestHandler {
       });
       return;
     }
-    await this.operations.writeFileContent(filepath, req.body as string | Buffer);
+    const preconditions = this.requestPreconditions(req, res);
+    if (preconditions === null) return;
+    try {
+      const version = await this.operations.writeFileContent(
+        filepath,
+        req.body as string | Buffer,
+        preconditions,
+      );
+      res.setHeader("ETag", formatEntityTag(version));
+    } catch (e) {
+      if (e instanceof PreconditionFailedError) {
+        this.returnPreconditionFailed(res, e);
+        return;
+      }
+      throw e;
+    }
     this.returnCannedResponse(res, { statusCode: 204 });
     return;
   }
 
   async vaultPut(req: express.Request, res: express.Response): Promise<void> {
-    const rawPath = decodeURIComponent(
-      req.path.slice(req.path.indexOf("/", 1) + 1),
-    );
-    const resolved = await this._resolvePathAndTarget(rawPath);
+    const segments = this.extractVaultPath(req, res);
+    if (segments === null) return;
+    const resolved = await this._resolvePathAndTarget(segments);
     if (resolved === null) {
       if (
-        rawPath
-          .split("/")
-          .some((s) => ["heading", "block", "frontmatter"].includes(s))
+        segments.some((s) => ["heading", "block", "frontmatter"].includes(s))
       ) {
         this.returnCannedResponse(res, { statusCode: 404 });
         return;
@@ -562,6 +1363,16 @@ export default class RequestHandler {
         });
         return;
       }
+      // A signed URL names a file and authorizes writing that file. These path elements
+      // turn the same request into a patch of a *different* file -- an upload URL for
+      // `note.md/heading/Title` edits `note.md` rather than creating anything -- and the
+      // signature says nothing about the distinction. Refuse rather than silently do the
+      // other thing.
+      if (this.requestIsSigned(req)) {
+        this.returnCannedResponse(res, { errorCode: ErrorCode.SignedUrlIsWholeFileOnly });
+        return;
+      }
+      res.set("Content-Location", encodeVaultPath(resolved.filePath));
       return this._vaultPatchTargeted(
         resolved.filePath,
         resolved.targetType,
@@ -569,34 +1380,154 @@ export default class RequestHandler {
         "replace",
         req,
         res,
-        { createTargetIfMissing: true },
+        { createTargetIfMissing: true, source: "path", targetSegments: resolved.targetSegments },
       );
+    }
+    // No URL target resolved: the request addresses a whole file. A segment
+    // holding a literal "/" cannot name one (see wholeFilePath), so it 404s.
+    const filePath = this.wholeFilePath(segments);
+    if (filePath === null) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
     }
     const headerTarget = this._getHeaderTarget(req, res);
     if (headerTarget !== undefined) {
       if (!headerTarget) return; // error already sent
+      // Same reasoning as the path-element case above, by the other route: these headers
+      // are not part of the signed material, so anyone holding the link can redirect a
+      // whole-file upload into a section edit.
+      if (this.requestIsSigned(req)) {
+        this.returnCannedResponse(res, { errorCode: ErrorCode.SignedUrlIsWholeFileOnly });
+        return;
+      }
       return this._vaultPatchTargeted(
-        rawPath,
+        filePath,
         headerTarget.targetType,
         headerTarget.target,
         "replace",
         req,
         res,
-        { createTargetIfMissing: true },
+        { createTargetIfMissing: true, source: "header" },
       );
     }
-    return this._vaultPut(rawPath, req, res);
+    return this._vaultPut(filePath, req, res);
   }
 
   async _vaultPatch(
     path: string,
     req: express.Request,
     res: express.Response,
+    urlTarget?: { targetType: string; target?: string; targetSegments?: string[] },
   ): Promise<void> {
     if (!path || path.endsWith("/")) {
       this.returnCannedResponse(res, { errorCode: ErrorCode.RequestMethodValidOnlyForFiles });
       return;
     }
+
+    // Select the engine by the Markdown-Patch-Version header. The 2.0 format is
+    // the default: its whole instruction is the JSON request body, so any
+    // request that does not opt into 1.x is routed there. `Markdown-Patch-Version: 1`
+    // opts back into the deprecated header-driven format below.
+    const version = resolvePatchVersion(req);
+    if (version === null) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidPatchVersionHeader });
+      return;
+    }
+
+    // If-Match/If-None-Match apply in every PATCH mode, checked against the
+    // file's bytes. A JSON instruction's own `ifMatch` field is separate, checked
+    // by the engine; when both are sent, both must hold.
+    const preconditions = this.requestPreconditions(req, res);
+    if (preconditions === null) return;
+
+    // Three targeting signals exist: URL path elements, Target-Type/Target
+    // headers, and the explicit instruction-body content type. They are
+    // mutually exclusive — a request supplying more than one is ambiguous
+    // about which specification governs, so it is rejected rather than have
+    // one silently win.
+    const headerTargeting = !!(req.get("Target-Type") || req.get("Target"));
+    const baseContentType = (req.get("Content-Type") ?? "")
+      .split(";")[0]
+      .trim()
+      .toLowerCase();
+    const isInstructionBody =
+      baseContentType === (ContentTypes.olrapiPatchInstruction as string);
+    if (
+      (urlTarget && headerTargeting) ||
+      (isInstructionBody && (urlTarget || headerTargeting))
+    ) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ConflictingTargetSpecification,
+      });
+      return;
+    }
+
+    if (version === 2) {
+      if (urlTarget) {
+        return this._vaultPatchRawContent(
+          path,
+          {
+            targetType: urlTarget.targetType,
+            target:
+              urlTarget.targetType === "heading"
+                ? urlTarget.targetSegments ?? [urlTarget.target ?? ""]
+                : urlTarget.target ?? "",
+          },
+          req,
+          res,
+          preconditions,
+        );
+      }
+      if (headerTargeting) {
+        // Header-based targeting is ambiguous between the 1.x and 2.0 header
+        // formats, so a request must *explicitly* pick a side: absent-version
+        // requests (which default to 2.0 everywhere else) fail loudly here
+        // rather than have an un-upgraded 1.x client's headers silently
+        // reinterpreted under 2.0 semantics.
+        if (req.get(MARKDOWN_PATCH_VERSION_HEADER) !== "2") {
+          this.returnCannedResponse(res, {
+            errorCode: ErrorCode.PatchHeaderTargetingRequiresExplicitVersion,
+          });
+          return;
+        }
+        const parsed = this._getPatchHeaderTarget(req, res);
+        if (!parsed) return;
+        return this._vaultPatchRawContent(path, parsed, req, res, preconditions);
+      }
+      const body: unknown = req.body;
+      if (typeof body !== "object" || body === null || Array.isArray(body)) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidPatchInstruction,
+          message:
+            "A PATCH expects a JSON instruction object as the request body (send Content-Type: application/json or application/vnd.olrapi.patch-instruction+json). For raw-content mode, target via URL path elements or Target-Type/Target headers with 'Markdown-Patch-Version: 2'. To use the deprecated 1.x header-driven format, set the 'Markdown-Patch-Version: 1' header.",
+        });
+        return;
+      }
+      return this._vaultPatchMdp2(
+        path,
+        body as Record<string, unknown>,
+        res,
+        preconditions,
+      );
+    }
+
+    // version === 1 with a URL-element target: URL targeting is purely a 2.0
+    // feature — before it existed, this path was simply an unresolvable file
+    // and 404'd, so an explicit error is clearer than silently keeping that.
+    if (urlTarget) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidPatchVersionHeader,
+        message:
+          "URL path-element targeting is a markdown-patch 2.0 feature; drop the 'Markdown-Patch-Version: 1' header, or use the deprecated 1.x Target-Type/Target headers instead.",
+      });
+      return;
+    }
+
+    // Past this point the request is served by the deprecated 1.x header-driven
+    // format. Advertise the deprecation and planned removal (RFC 8594) on every
+    // 1.x response — success or error — so clients are nudged toward the JSON
+    // instruction body handled above.
+    res.setHeader("Deprecation", `true; sunset-version="${MARKDOWN_PATCH_V1_SUNSET}"`);
 
     const operation = req.get("Operation");
     const targetType = req.get("Target-Type");
@@ -627,6 +1558,13 @@ export default class RequestHandler {
       return;
     }
     if (targetScope && !isPatchTargetScope(targetScope)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidTargetScopeHeader,
+        message: "Valid values are 'content', 'marker', and 'markerAndContent'.",
+      });
+      return;
+    }
+    if (targetType === "frontmatter" && targetScope && targetScope !== "content") {
       this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidTargetScopeHeader });
       return;
     }
@@ -639,13 +1577,20 @@ export default class RequestHandler {
       const patched = await this.operations.patchFileSection(
         path, targetType, rawTarget, operation, req.body, contentType,
         { createTargetIfMissing, rejectIfContentPreexists, trimTargetWhitespace, targetDelimiter, targetScope },
+        preconditions,
       );
+      res.setHeader("ETag", formatEntityTag(versionOf(patched)));
       res.status(200).send(patched);
     } catch (e) {
-      if (e instanceof FileNotFoundError) {
+      this.rethrowIfRefused(e);
+      if (e instanceof PreconditionFailedError) {
+        this.returnPreconditionFailed(res, e);
+      } else if (e instanceof FileNotFoundError) {
         this.returnCannedResponse(res, { statusCode: 404 });
       } else if (e instanceof PatchFailed) {
         this.returnCannedResponse(res, { errorCode: ErrorCode.PatchFailed, message: e.reason });
+      } else if (e instanceof FrontmatterParseError) {
+        this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidFrontmatter, message: e.message });
       } else {
         this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file") });
       }
@@ -653,12 +1598,293 @@ export default class RequestHandler {
   }
 
   async vaultPatch(req: express.Request, res: express.Response): Promise<void> {
-    const rawPath = decodeURIComponent(
-      req.path.slice(req.path.indexOf("/", 1) + 1),
-    );
-    return this._vaultPatch(rawPath, req, res);
+    const segments = this.extractVaultPath(req, res);
+    if (segments === null) return;
+    const resolved = await this._resolvePathAndTarget(segments);
+    if (resolved === null) {
+      if (
+        segments.some((s) => ["heading", "block", "frontmatter"].includes(s))
+      ) {
+        this.returnCannedResponse(res, { statusCode: 404 });
+        return;
+      }
+    } else if (resolved.targetType) {
+      res.set("Content-Location", encodeVaultPath(resolved.filePath));
+      return this._vaultPatch(resolved.filePath, req, res, {
+        targetType: resolved.targetType,
+        target: resolved.target,
+        targetSegments: resolved.targetSegments,
+      });
+    }
+    const filePath = this.wholeFilePath(segments);
+    if (filePath === null) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+    return this._vaultPatch(filePath, req, res);
   }
 
+  /** The markdown-patch 2.0 PATCH path. ("Mdp2" = markdown-patch 2.0, not the
+   *  removed API version 2.0 heading-based PATCH.) `_vaultPatch` routes here
+   *  when a request omits the Target-Type header and carries an object body: the
+   *  whole instruction is that JSON body (an `InstructionInput`), and the URL
+   *  supplies only the file. On success the patched document is returned as the
+   *  body, with any advisory warnings JSON- then percent-encoded into the
+   *  `Markdown-Patch-Warnings` response header. */
+  async _vaultPatchMdp2(
+    path: string,
+    candidate: Record<string, unknown>,
+    res: express.Response,
+    preconditions: WritePreconditions,
+  ): Promise<void> {
+    // Validate the whole instruction up front, against the same schema the
+    // engine validates with, so malformed input gets a clean 400 before the
+    // vault is touched. Reporting it as InvalidPatchInstruction with the
+    // schema's own field-path messages keeps the error pointed at the field the
+    // caller actually wrote: the 4005x codes name request *headers*, which a
+    // JSON instruction body does not have. Fields that reached here from
+    // headers (raw-content mode) were already validated by the caller, which
+    // owns the header-flavored wording for them.
+    const parsed = InstructionInputSchema.safeParse(candidate);
+    if (!parsed.success) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidPatchInstruction,
+        message: parsed.error.issues
+          .map((issue) =>
+            issue.path.length
+              ? `${issue.path.join(".")}: ${issue.message}`
+              : issue.message,
+          )
+          .join("; "),
+      });
+      return;
+    }
+
+    return this._respondMdp2(
+      path,
+      candidate as unknown as InstructionInput,
+      res,
+      preconditions,
+    );
+  }
+
+  /** Assemble a 2.0 instruction for a raw-content-mode PATCH: the target comes
+   *  from URL path elements or the Target-Type/Target headers (already parsed
+   *  by the caller), the remaining instruction fields from headers, and the
+   *  payload carrier from the raw request body — `text/*` is `content`,
+   *  `application/json` is `value`, and an empty body carries nothing (a
+   *  delete, or a move whose `destination` rides in the Destination header).
+   *  This exists so templating-oriented clients can splice unescaped markdown
+   *  into the body instead of JSON-escaping it into an instruction document.
+   *  The assembled candidate funnels through `_vaultPatchMdp2`, so validation
+   *  and error mapping are identical to the JSON-instruction mode. */
+  async _vaultPatchRawContent(
+    path: string,
+    target: { targetType: string; target: string[] | string | null },
+    req: express.Request,
+    res: express.Response,
+    preconditions: WritePreconditions,
+  ): Promise<void> {
+    // These headers only mean something to the deprecated 1.x engine
+    // (delimiter-joined targets, 1.x whitespace trimming). Silently ignoring
+    // them for an un-upgraded 1.x client would change what its request does,
+    // so they fail loudly toward the version choice instead.
+    if (req.get("Target-Delimiter") || req.get("Trim-Target-Whitespace")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.PatchHeaderTargetingRequiresExplicitVersion,
+      });
+      return;
+    }
+
+    const operation = req.get("Operation");
+    if (!operation) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.MissingOperation });
+      return;
+    }
+    if (!isV2Operation(operation)) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidOperation });
+      return;
+    }
+
+    const scope = req.get("Target-Scope");
+    if (scope !== undefined && !isV2Scope(scope)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidTargetScopeHeader,
+        message:
+          "Valid values are 'content', 'marker', 'markerAndContent', and 'parent'.",
+      });
+      return;
+    }
+
+    let destination: unknown;
+    const rawDestination = req.get("Destination");
+    if (rawDestination !== undefined) {
+      try {
+        destination = JSON.parse(decodeURIComponent(rawDestination)) as unknown;
+      } catch {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidDestinationHeader,
+          message:
+            "The 'Destination' header must be percent-encoded JSON, e.g. %7B%22parent%22%3A%5B%22Appendix%22%5D%2C%22place%22%3A%22last%22%7D.",
+        });
+        return;
+      }
+    }
+
+    // A strict integer only (`-?digits`): parseInt would accept trailing
+    // garbage like `1x`, silently landing the edit on the wrong block.
+    let within: number | undefined;
+    const rawWithin = req.get("Within");
+    if (rawWithin !== undefined) {
+      if (!/^-?\d+$/.test(rawWithin.trim())) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidWithinHeader,
+        });
+        return;
+      }
+      within = Number(rawWithin.trim());
+    }
+
+    // If-Match is not copied into the instruction's `ifMatch`: the caller has
+    // already parsed it, with If-None-Match, into `preconditions`, which the
+    // write checks against the file's bytes. That gives raw-content mode the same
+    // `*`, list, and quoted-or-bare handling as every other write.
+    const candidate: Record<string, unknown> = {
+      targetType: target.targetType,
+      target: target.target,
+      operation,
+    };
+    if (within !== undefined) candidate.within = within;
+    if (scope !== undefined) candidate.scope = scope;
+    if (destination !== undefined) candidate.destination = destination;
+    if (req.get("Create-Target-If-Missing") === "true") {
+      candidate.createTargetIfMissing = true;
+    }
+    if (req.get("Reject-If-Content-Preexists") === "true") {
+      candidate.rejectIfContentPreexists = true;
+    }
+
+    // A bodiless request still reaches the parsers, which leave `{}` (or an
+    // empty string/Buffer) behind — so emptiness is judged from the request
+    // framing headers first, never from the parsed value alone. An empty body
+    // deliberately maps to *no* carrier: a replace with an accidentally-empty
+    // template must fail loudly (missing carrier) rather than clear a section.
+    const contentLength = req.get("Content-Length");
+    const hasBodyBytes =
+      (contentLength !== undefined && contentLength !== "0") ||
+      req.get("Transfer-Encoding") !== undefined;
+    const body: unknown = req.body;
+    const bodyIsEmpty =
+      !hasBodyBytes ||
+      body === undefined ||
+      (typeof body === "string" && body.length === 0) ||
+      (Buffer.isBuffer(body) && body.length === 0);
+
+    if (!bodyIsEmpty) {
+      const baseContentType = (req.get("Content-Type") ?? "")
+        .split(";")[0]
+        .trim()
+        .toLowerCase();
+      if (baseContentType.startsWith("text/") && typeof body === "string") {
+        candidate.content = body;
+      } else if (baseContentType === (ContentTypes.json as string)) {
+        candidate.value = body;
+      } else {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidContentType,
+          message:
+            "A raw-content-mode PATCH accepts a text/* body (the `content` carrier), an application/json body (the `value` carrier), or no body at all (a delete, or a move via the Destination header).",
+        });
+        return;
+      }
+    }
+
+    return this._vaultPatchMdp2(path, candidate, res, preconditions);
+  }
+
+  /** Apply a single markdown-patch 2.0 instruction and write the standard 2.0
+   *  response: the patched document as the body, any advisory warnings
+   *  (percent-encoded JSON) in the `Markdown-Patch-Warnings` header, and the engine's
+   *  typed failures mapped to HTTP status codes. Shared by the JSON-body PATCH
+   *  endpoint and the path-element targeted GET/PUT/POST writes. */
+  async _respondMdp2(
+    filePath: string,
+    instruction: InstructionInput,
+    res: express.Response,
+    preconditions: WritePreconditions,
+  ): Promise<void> {
+    try {
+      const result = await this.operations.patchFileSectionMdp2(
+        filePath,
+        instruction,
+        preconditions,
+      );
+      if (result.warnings.length > 0) {
+        // Percent-encoded, like Target/Destination on the request side: a
+        // warning message embeds document text verbatim (e.g. a heading
+        // containing an emoji or accented letter), and HTTP header values must
+        // be Latin1 — Node throws on anything outside it. json+percent-encode
+        // rather than reject, so a legitimate warning never turns a successful
+        // patch into a reported failure.
+        res.setHeader(
+          "Markdown-Patch-Warnings",
+          encodeURIComponent(JSON.stringify(result.warnings)),
+        );
+      }
+      res.setHeader("Content-Type", ContentTypes.markdown + "; charset=utf-8");
+      res.setHeader("ETag", formatEntityTag(versionOf(result.document)));
+      res.status(200).send(result.document);
+    } catch (e) {
+      this.rethrowIfRefused(e);
+      if (e instanceof FileNotFoundError) {
+        this.returnCannedResponse(res, { statusCode: 404 });
+      } else if (e instanceof PreconditionFailedError) {
+        this.returnPreconditionFailed(res, e);
+      } else if (e instanceof TargetNotFoundError) {
+        this.returnCannedResponse(res, { statusCode: 404, message: e.message });
+      } else if (
+        e instanceof ContentPreexistsError ||
+        e instanceof FrontmatterKeyCollisionError
+      ) {
+        this.returnCannedResponse(res, { statusCode: 409, message: e.message });
+      } else if (
+        e instanceof InvalidCellError ||
+        e instanceof InvalidInstructionError ||
+        e instanceof InvalidCellContentError
+      ) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidPatchInstruction,
+          message: e.message,
+        });
+      } else if (e instanceof FrontmatterParseErrorV2) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidFrontmatter,
+          message: e.message,
+        });
+      } else {
+        // Any other failure to compute the patch is a client error against the
+        // supplied instruction, mirroring the coarse PatchFailed semantics of
+        // the 1.x endpoint rather than reporting a server fault.
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.PatchFailed,
+          message: sanitizeError(e, "patch file"),
+        });
+      }
+    }
+  }
+
+  /** Apply a targeted PUT/POST write to a sub-part of a document.
+   *
+   *  `source` records how the target was addressed:
+   *  - `"path"` — URL path elements (`.../heading/A/B`). The going-forward 2.0
+   *    way: routed through the 2.0 engine (heading levels normalized, engine owns
+   *    boundary whitespace), addressed array-natively via `targetSegments`.
+   *  - `"header"` — the deprecated `Target-Type`/`Target` headers. Only processed
+   *    when the caller opts into 1.x with `Markdown-Patch-Version: 1`; otherwise
+   *    rejected so a header-targeted write never silently clobbers the whole file.
+   *
+   *  Every 1.x request (either source under `Markdown-Patch-Version: 1`) carries
+   *  the sunset `Deprecation` advisory. */
   async _vaultPatchTargeted(
     filePath: string,
     targetType: string,
@@ -666,29 +1892,106 @@ export default class RequestHandler {
     operation: PatchOperation,
     req: express.Request,
     res: express.Response,
-    extraOpts?: { createTargetIfMissing?: boolean },
+    extraOpts: {
+      source: "path" | "header";
+      createTargetIfMissing?: boolean;
+      targetSegments?: string[];
+    },
   ): Promise<void> {
-    const contentType = req.get("Content-Type");
-    const createTargetIfMissing =
-      extraOpts?.createTargetIfMissing ??
-      req.get("Create-Target-If-Missing") == "true";
-    const rejectIfContentPreexists =
-      req.get("Reject-If-Content-Preexists") == "true";
-    const trimTargetWhitespace = req.get("Trim-Target-Whitespace") == "true";
-    const targetDelimiter = req.get("Target-Delimiter") || "::";
-    const rawTargetScope = req.get("Target-Scope");
-    const targetScope = rawTargetScope || undefined;
-
-    if (!isPatchTargetType(targetType)) {
-      this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidTargetTypeHeader });
+    const version = resolvePatchVersion(req);
+    if (version === null) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidPatchVersionHeader });
       return;
     }
+
+    if (extraOpts.source === "header" && version !== 1) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.HeaderTargetingRequiresVersion1 });
+      return;
+    }
+
+    const contentType = req.get("Content-Type");
     if (!isContentType(contentType)) {
       this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidContentType });
       return;
     }
-    if (targetScope && !isPatchTargetScope(targetScope)) {
-      this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidTargetScopeHeader });
+    const createTargetIfMissing =
+      extraOpts.createTargetIfMissing ??
+      req.get("Create-Target-If-Missing") == "true";
+    const rejectIfContentPreexists =
+      req.get("Reject-If-Content-Preexists") == "true";
+    const preconditions = this.requestPreconditions(req, res);
+    if (preconditions === null) return;
+
+    if (version === 1) {
+      res.setHeader("Deprecation", `true; sunset-version="${MARKDOWN_PATCH_V1_SUNSET}"`);
+
+      const trimTargetWhitespace = req.get("Trim-Target-Whitespace") == "true";
+      const targetDelimiter = req.get("Target-Delimiter") || "::";
+      const rawTargetScope = req.get("Target-Scope");
+      const targetScope = rawTargetScope || undefined;
+
+      if (!isPatchTargetType(targetType)) {
+        this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidTargetTypeHeader });
+        return;
+      }
+      if (targetScope && !isPatchTargetScope(targetScope)) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidTargetScopeHeader,
+          message:
+            "Valid values are 'content', 'marker', and 'markerAndContent'.",
+        });
+        return;
+      }
+      if (!target) {
+        this.returnCannedResponse(res, { errorCode: ErrorCode.MissingTargetHeader });
+        return;
+      }
+
+      try {
+        const patched = await this.operations.patchFileSection(
+          filePath, targetType, target, operation, req.body, contentType,
+          { createTargetIfMissing, rejectIfContentPreexists, trimTargetWhitespace, targetDelimiter, targetScope },
+          preconditions,
+        );
+        res.setHeader("ETag", formatEntityTag(versionOf(patched)));
+        res.status(200).send(patched);
+      } catch (e) {
+        this.rethrowIfRefused(e);
+        if (e instanceof PreconditionFailedError) {
+          this.returnPreconditionFailed(res, e);
+        } else if (e instanceof FileNotFoundError) {
+          this.returnCannedResponse(res, { statusCode: 404 });
+        } else if (e instanceof PatchFailed) {
+          this.returnCannedResponse(res, { errorCode: ErrorCode.PatchFailed, message: (e).reason });
+        } else if (e instanceof FrontmatterParseError) {
+          this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidFrontmatter, message: e.message });
+        } else {
+          this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file section") });
+        }
+      }
+      return;
+    }
+
+    // Reaching here means version === 2 and source === "path" (header-sourced
+    // requests under version 2 were already rejected above). Target-Scope,
+    // Target-Delimiter, and Trim-Target-Whitespace only mean something for the
+    // deprecated header-driven target — path-element targeting already carries
+    // an unambiguous address and always writes content scope. Silently ignoring
+    // these headers rather than rejecting them would be a data-loss hazard for
+    // an un-upgraded 1.x client: e.g. a `Target-Scope: marker` heading rename
+    // would instead replace the section's entire body.
+    if (
+      req.get("Target-Scope") ||
+      req.get("Target-Delimiter") ||
+      req.get("Trim-Target-Whitespace")
+    ) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.HeaderTargetingRequiresVersion1 });
+      return;
+    }
+
+    // version === 2 with path-element targeting → the 2.0 engine.
+    if (!isV2TargetType(targetType)) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.InvalidTargetTypeHeader });
       return;
     }
     if (!target) {
@@ -696,21 +1999,61 @@ export default class RequestHandler {
       return;
     }
 
-    try {
-      const patched = await this.operations.patchFileSection(
-        filePath, targetType, target, operation, req.body, contentType,
-        { createTargetIfMissing, rejectIfContentPreexists, trimTargetWhitespace, targetDelimiter, targetScope },
-      );
-      res.status(200).send(patched);
-    } catch (e) {
-      if (e instanceof FileNotFoundError) {
-        this.returnCannedResponse(res, { statusCode: 404 });
-      } else if (e instanceof PatchFailed) {
-        this.returnCannedResponse(res, { errorCode: ErrorCode.PatchFailed, message: (e).reason });
-      } else {
-        this.returnCannedResponse(res, { statusCode: 500, message: sanitizeError(e, "patch file section") });
-      }
-    }
+    // `operation` is only ever "replace" (PUT) or "append" (POST) from the call
+    // sites; both are valid 2.0 content-scope operations. A single cast bridges
+    // the 1.x operation union to the 2.0 discriminated instruction union, which
+    // TypeScript cannot narrow from a union-typed variable.
+    // The payload carrier follows what the body *is*, never a coercion of it: a
+    // string body is literal text (`content`), and a parsed JSON body is
+    // structured data (`value`). Whether that carrier is legal for the target is
+    // the engine's call — it accepts `value` as table rows on a block and as the
+    // value of a frontmatter key, and rejects it on a heading, whose content
+    // cell takes markdown text only. String()-coercing instead would splice
+    // "[object Object]" or "x,y" into the document and report success.
+    //
+    // Frontmatter is the one target whose payload is *always* a value: a
+    // `text/markdown` body there is the plain string to store, not markdown to
+    // splice, so it uses `value` regardless of the body's runtime type.
+    const isStructuredBody = typeof req.body !== "string";
+    const instruction = (
+      targetType === "frontmatter"
+        ? {
+            targetType: "frontmatter",
+            target,
+            operation,
+            scope: "content",
+            value: req.body as unknown,
+            createTargetIfMissing,
+            rejectIfContentPreexists,
+          }
+        : isStructuredBody
+          ? {
+              targetType,
+              target:
+                targetType === "heading"
+                  ? extraOpts.targetSegments ?? [target]
+                  : target,
+              operation,
+              scope: "content",
+              value: req.body as unknown,
+              createTargetIfMissing,
+              rejectIfContentPreexists,
+            }
+          : {
+              targetType,
+              target:
+                targetType === "heading"
+                  ? extraOpts.targetSegments ?? [target]
+                  : target,
+              operation,
+              scope: "content",
+              content: req.body as string,
+              createTargetIfMissing,
+              rejectIfContentPreexists,
+            }
+    ) as InstructionInput;
+
+    return this._respondMdp2(filePath, instruction, res, preconditions);
   }
 
   async _vaultPost(
@@ -730,21 +2073,33 @@ export default class RequestHandler {
       });
       return;
     }
-    await this.operations.appendFileContent(filepath, req.body);
+    const preconditions = this.requestPreconditions(req, res);
+    if (preconditions === null) return;
+    try {
+      const version = await this.operations.appendFileContent(
+        filepath,
+        req.body,
+        preconditions,
+      );
+      res.setHeader("ETag", formatEntityTag(version));
+    } catch (e) {
+      if (e instanceof PreconditionFailedError) {
+        this.returnPreconditionFailed(res, e);
+        return;
+      }
+      throw e;
+    }
     this.returnCannedResponse(res, { statusCode: 204 });
     return;
   }
 
   async vaultPost(req: express.Request, res: express.Response): Promise<void> {
-    const rawPath = decodeURIComponent(
-      req.path.slice(req.path.indexOf("/", 1) + 1),
-    );
-    const resolved = await this._resolvePathAndTarget(rawPath);
+    const segments = this.extractVaultPath(req, res);
+    if (segments === null) return;
+    const resolved = await this._resolvePathAndTarget(segments);
     if (resolved === null) {
       if (
-        rawPath
-          .split("/")
-          .some((s) => ["heading", "block", "frontmatter"].includes(s))
+        segments.some((s) => ["heading", "block", "frontmatter"].includes(s))
       ) {
         this.returnCannedResponse(res, { statusCode: 404 });
         return;
@@ -756,6 +2111,7 @@ export default class RequestHandler {
         });
         return;
       }
+      res.set("Content-Location", encodeVaultPath(resolved.filePath));
       return this._vaultPatchTargeted(
         resolved.filePath,
         resolved.targetType,
@@ -763,26 +2119,33 @@ export default class RequestHandler {
         "append",
         req,
         res,
+        { source: "path", targetSegments: resolved.targetSegments },
       );
+    }
+    const filePath = this.wholeFilePath(segments);
+    if (filePath === null) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
     }
     const headerTarget = this._getHeaderTarget(req, res);
     if (headerTarget !== undefined) {
       if (!headerTarget) return; // error already sent
       return this._vaultPatchTargeted(
-        rawPath,
+        filePath,
         headerTarget.targetType,
         headerTarget.target,
         "append",
         req,
         res,
+        { source: "header" },
       );
     }
-    return this._vaultPost(rawPath, req, res);
+    return this._vaultPost(filePath, req, res);
   }
 
   async _vaultDelete(
     path: string,
-    _req: express.Request,
+    req: express.Request,
     res: express.Response,
   ): Promise<void> {
     if (!path || path.endsWith("/")) {
@@ -791,10 +2154,16 @@ export default class RequestHandler {
       });
       return;
     }
+    const permanent = req.query.permanent === "true";
+    const preconditions = this.requestPreconditions(req, res);
+    if (preconditions === null) return;
     try {
-      await this.operations.deleteVaultFile(path);
+      await this.operations.deleteVaultFile(path, permanent, preconditions);
     } catch (e) {
-      if (e instanceof FileNotFoundError) {
+      this.rethrowIfRefused(e);
+      if (e instanceof PreconditionFailedError) {
+        this.returnPreconditionFailed(res, e);
+      } else if (e instanceof FileNotFoundError) {
         this.returnCannedResponse(res, { statusCode: 404 });
       } else {
         this.returnCannedResponse(res, { statusCode: 500 });
@@ -809,10 +2178,9 @@ export default class RequestHandler {
     req: express.Request,
     res: express.Response,
   ): Promise<void> {
-    const rawPath = decodeURIComponent(
-      req.path.slice(req.path.indexOf("/", 1) + 1),
-    );
-    const resolved = await this._resolvePathAndTarget(rawPath);
+    const segments = this.extractVaultPath(req, res);
+    if (segments === null) return;
+    const resolved = await this._resolvePathAndTarget(segments);
     if (resolved?.targetType) {
       this.returnCannedResponse(res, {
         statusCode: 405,
@@ -821,7 +2189,12 @@ export default class RequestHandler {
       });
       return;
     }
-    return this._vaultDelete(rawPath, req, res);
+    const filePath = this.wholeFilePath(segments);
+    if (filePath === null) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+    return this._vaultDelete(filePath, req, res);
   }
 
   async _vaultMove(
@@ -862,18 +2235,19 @@ export default class RequestHandler {
       return;
     }
 
-    if (normalized.startsWith("/")) {
+    if (!vaultPathIsContained(normalized)) {
       this.returnCannedResponse(res, {
         errorCode: ErrorCode.PathTraversalNotAllowed,
       });
       return;
     }
 
-    const syntheticRoot = "/vault";
-    const resolved = posix.resolve(syntheticRoot, normalized);
-    if (resolved !== syntheticRoot && !resolved.startsWith(syntheticRoot + "/")) {
+    if (
+      !this.settings.enableConfigDirAccess &&
+      this.pathIsInConfigDir(normalized)
+    ) {
       this.returnCannedResponse(res, {
-        errorCode: ErrorCode.PathTraversalNotAllowed,
+        errorCode: ErrorCode.ConfigDirAccessNotAllowed,
       });
       return;
     }
@@ -882,16 +2256,30 @@ export default class RequestHandler {
       ? normalized + sourceFilename
       : normalized;
 
+    const preconditions = this.requestPreconditions(req, res);
+    if (preconditions === null) return;
+
     try {
-      const actualPath = await this.operations.moveVaultFile(path, newPath, allowOverwrite);
-      res.set("Content-Location", encodeURI(actualPath));
+      const actualPath = await this.operations.moveVaultFile(
+        path,
+        newPath,
+        allowOverwrite,
+        preconditions,
+      );
+      res.set("Content-Location", encodeVaultPath(actualPath));
       this.returnCannedResponse(res, { statusCode: 204 });
     } catch (error) {
-      if (error instanceof FileNotFoundError) {
+      if (error instanceof PreconditionFailedError) {
+        this.returnPreconditionFailed(res, error);
+      } else if (error instanceof FileNotFoundError) {
         this.returnCannedResponse(res, { statusCode: 404 });
       } else if (error instanceof DestinationAlreadyExistsError) {
         this.returnCannedResponse(res, {
           errorCode: ErrorCode.DestinationAlreadyExists,
+        });
+      } else if (error instanceof ConfigDirAccessError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.ConfigDirAccessNotAllowed,
         });
       } else {
         this.returnCannedResponse(res, {
@@ -903,37 +2291,138 @@ export default class RequestHandler {
   }
 
   async vaultMove(req: express.Request, res: express.Response): Promise<void> {
-    const path = decodeURIComponent(
-      req.path.slice(req.path.indexOf("/", 1) + 1),
-    );
-    return this._vaultMove(path, req, res);
+    const segments = this.extractVaultPath(req, res);
+    if (segments === null) return;
+    // Move addresses a whole file; a %2F-bearing segment can't name one.
+    const filePath = this.wholeFilePath(segments);
+    if (filePath === null) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+    return this._vaultMove(filePath, req, res);
   }
 
-  getPeriodicNoteInterface(): Record<string, PeriodicNoteInterface> {
-    return this.operations.getPeriodicNoteInterface();
+  async _vaultCopy(
+    path: string,
+    req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    if (!path || path.endsWith("/")) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.RequestMethodValidOnlyForFiles,
+      });
+      return;
+    }
+
+    const rawDestination = req.header("Destination");
+    const allowOverwrite = req.header("Allow-Overwrite") === "true";
+
+    if (rawDestination === undefined) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.MissingDestinationHeader,
+      });
+      return;
+    }
+
+    const sourceFilename = path.includes("/")
+      ? path.slice(path.lastIndexOf("/") + 1)
+      : path;
+
+    let normalized: string;
+    try {
+      normalized = decodeURIComponent(rawDestination.trim())
+        .replace(/\\/g, "/")
+        .replace(/\/+/g, "/");
+    } catch {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.InvalidDestinationHeader,
+      });
+      return;
+    }
+
+    if (!vaultPathIsContained(normalized)) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.PathTraversalNotAllowed,
+      });
+      return;
+    }
+
+    if (
+      !this.settings.enableConfigDirAccess &&
+      this.pathIsInConfigDir(normalized)
+    ) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ConfigDirAccessNotAllowed,
+      });
+      return;
+    }
+
+    const newPath = !normalized || normalized.endsWith("/")
+      ? normalized + sourceFilename
+      : normalized;
+
+    const preconditions = this.requestPreconditions(req, res);
+    if (preconditions === null) return;
+
+    try {
+      const actualPath = await this.operations.copyVaultFile(
+        path,
+        newPath,
+        allowOverwrite,
+        preconditions,
+      );
+      res.set("Content-Location", encodeVaultPath(actualPath));
+      this.returnCannedResponse(res, { statusCode: 204 });
+    } catch (error) {
+      if (error instanceof PreconditionFailedError) {
+        this.returnPreconditionFailed(res, error);
+      } else if (error instanceof FileNotFoundError) {
+        this.returnCannedResponse(res, { statusCode: 404 });
+      } else if (error instanceof DestinationAlreadyExistsError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.DestinationAlreadyExists,
+        });
+      } else if (error instanceof ConfigDirAccessError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.ConfigDirAccessNotAllowed,
+        });
+      } else {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.FileOperationFailed,
+          message: sanitizeError(error, "copy file"),
+        });
+      }
+    }
   }
 
-  periodicGetInterface(
-    period: string,
-  ): [PeriodicNoteInterface | null, ErrorCode | null] {
-    return this.operations.periodicGetInterface(period);
+  async vaultCopy(req: express.Request, res: express.Response): Promise<void> {
+    const segments = this.extractVaultPath(req, res);
+    if (segments === null) return;
+    // Copy addresses a whole file; a %2F-bearing segment can't name one.
+    const filePath = this.wholeFilePath(segments);
+    if (filePath === null) {
+      this.returnCannedResponse(res, { statusCode: 404 });
+      return;
+    }
+    return this._vaultCopy(filePath, req, res);
   }
 
-  periodicGetNote(
-    periodName: string,
-    timestamp: number,
-  ): [TFile | null, ErrorCode | null] {
-    return this.operations.periodicGetNote(periodName, timestamp);
-  }
-
-  async periodicGetOrCreateNote(
-    periodName: string,
-    timestamp: number,
-  ): Promise<[TFile | null, ErrorCode | null]> {
-    return this.operations.periodicGetOrCreateNote(periodName, timestamp);
-  }
-
-  redirectToVaultPath(
+  /**
+   * Delegates an `/active/` request to the corresponding `/vault/<path>`
+   * handler once the active file is known, tagging the response with the
+   * resolved path first.
+   *
+   * `handler` must be returned, not fired-and-forgotten (a bare call
+   * discards its promise, and with it any rejection -- the request would
+   * then hang forever, since the same failure a `/vault/` request routes to
+   * `errorHandler` via the `handle()` wrapper would here just vanish as an
+   * unhandled rejection with no response ever sent). Returning it lets this
+   * function's own promise adopt the handler's, so `handle()`'s `.catch(next)`
+   * still sees a failure that occurs inside it. This exact shape
+   * (`void this._vaultPut(...)`) previously caused unresponsive `/active/`
+   * requests whenever the underlying write threw.
+   */
+  async redirectToVaultPath(
     file: TFile,
     req: express.Request,
     res: express.Response,
@@ -941,204 +2430,12 @@ export default class RequestHandler {
       path: string,
       req: express.Request,
       res: express.Response,
-    ) => void,
-  ): void {
+    ) => Promise<void>,
+  ): Promise<void> {
     const path = file.path;
-    res.set("Content-Location", encodeURI(path));
+    res.set("Content-Location", encodeVaultPath(path));
 
     return handler(path, req, res);
-  }
-
-  getPeriodicDateFromParams(params: {
-    year?: string;
-    month?: string;
-    day?: string;
-  }): number {
-    const { year, month, day } = params;
-
-    if (year && month && day) {
-      const date = new Date(parseInt(year), parseInt(month) - 1, parseInt(day));
-      return date.getTime();
-    }
-
-    return Date.now();
-  }
-
-  async periodicGet(
-    req: express.Request,
-    res: express.Response,
-  ): Promise<void> {
-    const date = this.getPeriodicDateFromParams(req.params);
-    const [file, err] = this.periodicGetNote(req.params.period, date);
-    if (err || !file) {
-      this.returnCannedResponse(res, {
-        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
-      });
-      return;
-    }
-
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    const path = file.path + (suffix ? "/" + suffix : "");
-    res.set("Content-Location", encodeURI(file.path));
-    return this._vaultGet(path, req, res);
-  }
-
-  async periodicPut(
-    req: express.Request,
-    res: express.Response,
-  ): Promise<void> {
-    const date = this.getPeriodicDateFromParams(req.params);
-    const [file, err] = await this.periodicGetOrCreateNote(
-      req.params.period,
-      date,
-    );
-    if (err || !file) {
-      this.returnCannedResponse(res, {
-        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
-      });
-      return;
-    }
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    if (suffix) {
-      const resolved = await this._resolvePathAndTarget(file.path + "/" + suffix);
-      if (resolved?.targetType) {
-        if (req.get("Target-Type") || req.get("Target")) {
-          this.returnCannedResponse(res, {
-            errorCode: ErrorCode.ConflictingTargetSpecification,
-          });
-          return;
-        }
-        res.set("Content-Location", encodeURI(file.path));
-        return this._vaultPatchTargeted(
-          resolved.filePath,
-          resolved.targetType,
-          resolved.target ?? "",
-          "replace",
-          req,
-          res,
-          { createTargetIfMissing: true },
-        );
-      }
-    }
-    const headerTarget = this._getHeaderTarget(req, res);
-    if (headerTarget !== undefined) {
-      if (!headerTarget) return; // error already sent
-      res.set("Content-Location", encodeURI(file.path));
-      return this._vaultPatchTargeted(
-        file.path,
-        headerTarget.targetType,
-        headerTarget.target,
-        "replace",
-        req,
-        res,
-        { createTargetIfMissing: true },
-      );
-    }
-    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => { void this._vaultPut(p, rq, rs); });
-  }
-
-  async periodicPost(
-    req: express.Request,
-    res: express.Response,
-  ): Promise<void> {
-    const date = this.getPeriodicDateFromParams(req.params);
-    const [file, err] = await this.periodicGetOrCreateNote(
-      req.params.period,
-      date,
-    );
-    if (err || !file) {
-      this.returnCannedResponse(res, {
-        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
-      });
-      return;
-    }
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    if (suffix) {
-      const resolved = await this._resolvePathAndTarget(file.path + "/" + suffix);
-      if (resolved?.targetType) {
-        if (req.get("Target-Type") || req.get("Target")) {
-          this.returnCannedResponse(res, {
-            errorCode: ErrorCode.ConflictingTargetSpecification,
-          });
-          return;
-        }
-        res.set("Content-Location", encodeURI(file.path));
-        return this._vaultPatchTargeted(
-          resolved.filePath,
-          resolved.targetType,
-          resolved.target ?? "",
-          "append",
-          req,
-          res,
-        );
-      }
-    }
-    const headerTarget = this._getHeaderTarget(req, res);
-    if (headerTarget !== undefined) {
-      if (!headerTarget) return; // error already sent
-      res.set("Content-Location", encodeURI(file.path));
-      return this._vaultPatchTargeted(
-        file.path,
-        headerTarget.targetType,
-        headerTarget.target,
-        "append",
-        req,
-        res,
-      );
-    }
-    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => { void this._vaultPost(p, rq, rs); });
-  }
-
-  async periodicPatch(
-    req: express.Request,
-    res: express.Response,
-  ): Promise<void> {
-    const date = this.getPeriodicDateFromParams(req.params);
-    const [file, err] = await this.periodicGetOrCreateNote(
-      req.params.period,
-      date,
-    );
-    if (err || !file) {
-      this.returnCannedResponse(res, {
-        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
-      });
-      return;
-    }
-    return this.redirectToVaultPath(
-      file,
-      req,
-      res,
-      (p, rq, rs) => { void this._vaultPatch(p, rq, rs); },
-    );
-  }
-
-  async periodicDelete(
-    req: express.Request,
-    res: express.Response,
-  ): Promise<void> {
-    const date = this.getPeriodicDateFromParams(req.params);
-    const [file, err] = this.periodicGetNote(req.params.period, date);
-    if (err || !file) {
-      this.returnCannedResponse(res, {
-        errorCode: err ?? ErrorCode.PeriodicNoteDoesNotExist,
-      });
-      return;
-    }
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    if (suffix) {
-      this.returnCannedResponse(res, {
-        statusCode: 405,
-        message:
-          "Deleting a targeted section via URL is not supported. Use PATCH with Operation: replace and an empty body instead.",
-      });
-      return;
-    }
-    return this.redirectToVaultPath(
-      file,
-      req,
-      res,
-      (p, rq, rs) => { void this._vaultDelete(p, rq, rs); },
-    );
   }
 
   async activeFileGet(
@@ -1151,10 +2448,14 @@ export default class RequestHandler {
       return;
     }
 
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    const path = file.path + (suffix ? "/" + suffix : "");
-    res.set("Content-Location", encodeURI(file.path));
-    return this._vaultGet(path, req, res);
+    const suffixSegments = this.rawSuffixSegments(req, res);
+    if (suffixSegments === null) return;
+    res.set("Content-Location", encodeVaultPath(file.path));
+    return this._vaultGet(
+      [...file.path.split("/"), ...suffixSegments],
+      req,
+      res,
+    );
   }
 
   async activeFilePut(
@@ -1166,9 +2467,13 @@ export default class RequestHandler {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
     }
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    if (suffix) {
-      const resolved = await this._resolvePathAndTarget(file.path + "/" + suffix);
+    const suffixSegments = this.rawSuffixSegments(req, res);
+    if (suffixSegments === null) return;
+    if (suffixSegments.length > 0) {
+      const resolved = await this._resolvePathAndTarget([
+        ...file.path.split("/"),
+        ...suffixSegments,
+      ]);
       if (resolved?.targetType) {
         if (req.get("Target-Type") || req.get("Target")) {
           this.returnCannedResponse(res, {
@@ -1176,7 +2481,7 @@ export default class RequestHandler {
           });
           return;
         }
-        res.set("Content-Location", encodeURI(file.path));
+        res.set("Content-Location", encodeVaultPath(file.path));
         return this._vaultPatchTargeted(
           resolved.filePath,
           resolved.targetType,
@@ -1184,14 +2489,14 @@ export default class RequestHandler {
           "replace",
           req,
           res,
-          { createTargetIfMissing: true },
+          { createTargetIfMissing: true, source: "path", targetSegments: resolved.targetSegments },
         );
       }
     }
     const headerTarget = this._getHeaderTarget(req, res);
     if (headerTarget !== undefined) {
       if (!headerTarget) return; // error already sent
-      res.set("Content-Location", encodeURI(file.path));
+      res.set("Content-Location", encodeVaultPath(file.path));
       return this._vaultPatchTargeted(
         file.path,
         headerTarget.targetType,
@@ -1199,10 +2504,10 @@ export default class RequestHandler {
         "replace",
         req,
         res,
-        { createTargetIfMissing: true },
+        { createTargetIfMissing: true, source: "header" },
       );
     }
-    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => { void this._vaultPut(p, rq, rs); });
+    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => this._vaultPut(p, rq, rs));
   }
 
   async activeFilePost(
@@ -1214,9 +2519,13 @@ export default class RequestHandler {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
     }
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    if (suffix) {
-      const resolved = await this._resolvePathAndTarget(file.path + "/" + suffix);
+    const suffixSegments = this.rawSuffixSegments(req, res);
+    if (suffixSegments === null) return;
+    if (suffixSegments.length > 0) {
+      const resolved = await this._resolvePathAndTarget([
+        ...file.path.split("/"),
+        ...suffixSegments,
+      ]);
       if (resolved?.targetType) {
         if (req.get("Target-Type") || req.get("Target")) {
           this.returnCannedResponse(res, {
@@ -1224,7 +2533,7 @@ export default class RequestHandler {
           });
           return;
         }
-        res.set("Content-Location", encodeURI(file.path));
+        res.set("Content-Location", encodeVaultPath(file.path));
         return this._vaultPatchTargeted(
           resolved.filePath,
           resolved.targetType,
@@ -1232,13 +2541,14 @@ export default class RequestHandler {
           "append",
           req,
           res,
+          { source: "path", targetSegments: resolved.targetSegments },
         );
       }
     }
     const headerTarget = this._getHeaderTarget(req, res);
     if (headerTarget !== undefined) {
       if (!headerTarget) return; // error already sent
-      res.set("Content-Location", encodeURI(file.path));
+      res.set("Content-Location", encodeVaultPath(file.path));
       return this._vaultPatchTargeted(
         file.path,
         headerTarget.targetType,
@@ -1246,9 +2556,10 @@ export default class RequestHandler {
         "append",
         req,
         res,
+        { source: "header" },
       );
     }
-    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => { void this._vaultPost(p, rq, rs); });
+    return this.redirectToVaultPath(file, req, res, (p, rq, rs) => this._vaultPost(p, rq, rs));
   }
 
   async activeFilePatch(
@@ -1260,11 +2571,27 @@ export default class RequestHandler {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
     }
+    const suffixSegments = this.rawSuffixSegments(req, res);
+    if (suffixSegments === null) return;
+    if (suffixSegments.length > 0) {
+      const resolved = await this._resolvePathAndTarget([
+        ...file.path.split("/"),
+        ...suffixSegments,
+      ]);
+      if (resolved?.targetType) {
+        res.set("Content-Location", encodeVaultPath(file.path));
+        return this._vaultPatch(resolved.filePath, req, res, {
+          targetType: resolved.targetType,
+          target: resolved.target,
+          targetSegments: resolved.targetSegments,
+        });
+      }
+    }
     return this.redirectToVaultPath(
       file,
       req,
       res,
-      (p, rq, rs) => { void this._vaultPatch(p, rq, rs); },
+      (p, rq, rs) => this._vaultPatch(p, rq, rs),
     );
   }
 
@@ -1277,8 +2604,9 @@ export default class RequestHandler {
       this.returnCannedResponse(res, { statusCode: 404 });
       return;
     }
-    const suffix = req.params[0] ? decodeURIComponent(req.params[0]) : "";
-    if (suffix) {
+    const suffixSegments = this.rawSuffixSegments(req, res);
+    if (suffixSegments === null) return;
+    if (suffixSegments.length > 0) {
       this.returnCannedResponse(res, {
         statusCode: 405,
         message:
@@ -1290,7 +2618,7 @@ export default class RequestHandler {
       file,
       req,
       res,
-      (p, rq, rs) => { void this._vaultDelete(p, rq, rs); },
+      (p, rq, rs) => this._vaultDelete(p, rq, rs),
     );
   }
 
@@ -1337,8 +2665,29 @@ export default class RequestHandler {
     const contextLength = Number.isNaN(contextLengthRaw)
       ? 100
       : contextLengthRaw;
+
+    // Unlike contextLength, which has always fallen back to its default on bad
+    // input, the limits are strict: a typo that silently returned every match is
+    // exactly the oversized response they exist to prevent.
+    const limits: { maxResults?: number; maxMatchesPerFile?: number } = {};
+    for (const name of ["maxResults", "maxMatchesPerFile"] as const) {
+      const raw = req.query[name];
+      if (raw === undefined) continue;
+      if (typeof raw !== "string" || !/^\d+$/.test(raw) || Number(raw) < 1) {
+        return this.returnCannedResponse(res, {
+          message: `'?${name}=' must be a single positive integer.`,
+          errorCode: ErrorCode.InvalidSearch,
+        });
+      }
+      limits[name] = Number(raw);
+    }
+
     try {
-      const results = await this.operations.simpleSearch(query, contextLength);
+      const { results, totalResults } = await this.operations.simpleSearch(query, {
+        contextLength,
+        ...limits,
+      });
+      res.set("Total-Results", String(totalResults));
       res.json(results);
     } catch (e) {
       console.error("Could not prepare simple search: ", e);
@@ -1423,7 +2772,10 @@ export default class RequestHandler {
       "Content-type",
       `application/octet-stream; filename="${CERT_NAME}"`,
     );
-    res.status(200).send(this.settings.crypto.cert);
+    // Clients import this to trust the server, so hand them the authority
+    // that signed the server certificate when there is one; material from
+    // before the CA/leaf split has only the self-signed certificate itself.
+    res.status(200).send(this.settings.crypto.caCert ?? this.settings.crypto.cert);
   }
 
   async openapiYamlGet(
@@ -1431,7 +2783,14 @@ export default class RequestHandler {
     res: express.Response,
   ): Promise<void> {
     res.setHeader("Content-Type", "application/yaml; charset=utf-8");
-    res.status(200).send(openapiYaml);
+    res.status(200).send(this.openApiSpec.yaml());
+  }
+
+  async openapiJsonGet(
+    _req: express.Request,
+    res: express.Response,
+  ): Promise<void> {
+    res.status(200).json(this.openApiSpec.json());
   }
 
   async notFoundHandler(
@@ -1462,11 +2821,139 @@ export default class RequestHandler {
       });
       return;
     }
+    // Every route that takes a vault path checks it before calling through, so
+    // this is the backstop for one that does not: VaultOperations refuses, and the
+    // client still gets 40021 rather than a 500 naming an internal error.
+    if (err instanceof PathTraversalError) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.PathTraversalNotAllowed,
+      });
+      return;
+    }
+    if (err instanceof ConfigDirAccessError) {
+      this.returnCannedResponse(res, {
+        errorCode: ErrorCode.ConfigDirAccessNotAllowed,
+      });
+      return;
+    }
+    // Every conditional write maps this itself; this is the backstop for one
+    // that does not, so a failed precondition never reads as a server fault.
+    if (err instanceof PreconditionFailedError) {
+      this.returnPreconditionFailed(res, err);
+      return;
+    }
     this.returnCannedResponse(res, {
       statusCode: 500,
       message: sanitizeError(err, "internal server error"),
     });
     return;
+  }
+
+  /** An error body that also lists what can be streamed. */
+  private returnEventError(res: express.Response, errorCode: ErrorCode): void {
+    res.status(Math.floor(errorCode / 100)).json({
+      message: ERROR_CODE_MESSAGES[errorCode],
+      errorCode,
+      supportedEvents: this.events.supportedEvents(),
+    });
+  }
+
+  /** `/events/` and `/events/<emitter>/`: there is no wildcard to stream. */
+  async eventsWithoutName(_req: express.Request, res: express.Response): Promise<void> {
+    this.returnEventError(res, ErrorCode.EventNameRequired);
+  }
+
+  /**
+   * `POST /events/<emitter>/<event>/`: register a subscription. The body is an optional
+   * JSONLogic filter; the response names the stream to open.
+   */
+  async eventsSubscribePost(req: express.Request, res: express.Response): Promise<void> {
+    const { emitter, event } = req.params;
+    if (!this.events.isStreamable(emitter, event)) {
+      this.returnEventError(res, ErrorCode.UnknownEvent);
+      return;
+    }
+
+    // No body, an empty one, or `{}` (which is what Express leaves behind for an empty
+    // JSON body) means every event. A literal `{}` filter could never match anything,
+    // so reading it as "no filter" loses nothing.
+    let filter: unknown = null;
+    const body: unknown = req.body;
+    const bodyIsEmpty =
+      body === undefined ||
+      ((Buffer.isBuffer(body) || typeof body === "string") && body.length === 0) ||
+      (typeof body === "object" &&
+        body !== null &&
+        !Array.isArray(body) &&
+        !Buffer.isBuffer(body) &&
+        Object.keys(body).length === 0);
+    if (!bodyIsEmpty) {
+      if (!req.is([ContentTypes.jsonLogic, ContentTypes.json])) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidContentType,
+          message: `Send the filter as ${ContentTypes.jsonLogic} or ${ContentTypes.json}.`,
+        });
+        return;
+      }
+      filter = body;
+    }
+
+    const rawTtl = typeof req.query.ttl === "string" ? Number(req.query.ttl) : undefined;
+    const ttlSeconds = clampSignedUrlTtl(rawTtl ?? this.settings.signedUrlTtlSeconds);
+
+    try {
+      const grant = this.events.createListener(
+        emitter,
+        event,
+        filter,
+        ttlSeconds,
+        requestBaseUrl(req),
+        this.settings.enableSignedUrls ? this.urlSigner : null,
+      );
+      res.status(201).json(grant);
+    } catch (e) {
+      if (e instanceof InvalidEventFilterError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.InvalidFilterQuery,
+          message: e.message,
+        });
+        return;
+      }
+      if (e instanceof TooManySubscriptionsError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.EventCapacityReached,
+          message: e.message,
+        });
+        return;
+      }
+      throw e;
+    }
+  }
+
+  /** `GET /events/<emitter>/<event>/<id>/`: open the subscription's stream. */
+  async eventsStreamGet(req: express.Request, res: express.Response): Promise<void> {
+    const { emitter, event, id } = req.params;
+    if (!this.events.isStreamable(emitter, event)) {
+      this.returnEventError(res, ErrorCode.UnknownEvent);
+      return;
+    }
+    const subscription = this.events.get(emitter, event, id);
+    if (!subscription) {
+      this.returnCannedResponse(res, { errorCode: ErrorCode.EventSubscriptionNotFound });
+      return;
+    }
+    try {
+      await this.events.open(subscription, req, res);
+    } catch (e) {
+      if (e instanceof TooManyStreamsError) {
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.EventCapacityReached,
+          message: e.message,
+        });
+        return;
+      }
+      throw e;
+    }
   }
 
   private handle(
@@ -1482,7 +2969,7 @@ export default class RequestHandler {
       if (this.settings.enableVerboseLogging) {
         const originalSend = res.send;
         res.send = function (body, ...args) {
-          console.debug(`[REST API] ${req.method} ${req.url} => ${res.statusCode}`);
+          console.debug(`[REST API] ${req.method} ${redactSignedUrl(req.url)} => ${res.statusCode}`);
           return originalSend.apply(res, [body, ...args]) as ReturnType<typeof res.send>;
         };
       }
@@ -1515,12 +3002,7 @@ export default class RequestHandler {
     });
     // --------------------------------------------------
     this.api.use(responseTime());
-    const CORS_OPTIONS: cors.CorsOptions = {
-      origin: ['app://obsidian.md', 'capacitor://localhost', 'http://localhost'],
-      methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "MOVE"],
-    };
-
-    this.api.use(cors(CORS_OPTIONS));
+    this.api.use(cors(corsOptions));
 
     this.api.use((req, res, next) => {
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -1549,8 +3031,47 @@ export default class RequestHandler {
       next();
     });
 
+    // Failed-authentication throttle. One limiter, installed in the two places a
+    // credential is actually checked: at the top of the MCP router, and immediately ahead
+    // of the authentication middleware that guards everything else (including `GET /`
+    // and the other exempt routes, which still look at a key they are sent). It is *not*
+    // in front of the public extension router: an extension's public route never
+    // consults this server's credentials, so a header or `sig`/`exp` pair sent there is
+    // the extension's business and must not be counted or refused on its behalf. Both
+    // mounts are after `cors`, so a 429 carries the same CORS headers as any other answer
+    // and a preflight never reaches it. `skip` keeps everything but a wrong credential
+    // out of the counter entirely: a request with the right key costs one string
+    // comparison here and is never delayed.
+    this.authenticationFailureStore?.shutdown();
+    this.authenticationFailureStore = new MemoryStore();
+    const authenticationFailureLimiter = rateLimit({
+      windowMs: AuthenticationFailureWindowMs,
+      limit: AuthenticationFailureLimit,
+      store: this.authenticationFailureStore,
+      skip: (req) => !this.credentialIsRejected(req),
+      // Neither family of quota headers: they would ride along on every counted 401 and
+      // tell a guesser how many free attempts remain. `Retry-After` is the one header the
+      // contract promises, and the library only sets it alongside the quota headers, so
+      // the refusal sets it itself from the window the store reports.
+      standardHeaders: false,
+      legacyHeaders: false,
+      handler: (req, res) => {
+        const info = (req as express.Request & { rateLimit?: RateLimitInfo }).rateLimit;
+        const resetTime = info?.resetTime?.getTime() ?? Date.now() + AuthenticationFailureWindowMs;
+        res.setHeader("Retry-After", String(Math.max(1, Math.ceil((resetTime - Date.now()) / 1000))));
+        this.returnCannedResponse(res, {
+          errorCode: ErrorCode.TooManyAuthenticationFailures,
+        });
+      },
+      // The plugin never sits behind a proxy it trusts, so a forwarded-for header is
+      // just a header; the library's warning about ignoring it would only be noise in
+      // the developer console.
+      validate: { xForwardedForHeader: false },
+    });
+
     const mcpRouter = express.Router();
-    mcpRouter.use(cors(CORS_OPTIONS));
+    mcpRouter.use(cors(corsOptions));
+    mcpRouter.use(authenticationFailureLimiter);
     mcpRouter.use((req, res, next) => {
       if (!this.requestIsAuthenticated(req)) {
         this.returnCannedResponse(res, {
@@ -1560,21 +3081,73 @@ export default class RequestHandler {
       }
       next();
     });
+    // Body parsing runs before the version filter: deciding what an unrecognised version
+    // header means requires knowing whether the request is sessionless- or sessionful-shaped, and
+    // that is a property of the body.
+    mcpRouter.use(express.json({ limit: MaximumRequestSize }));
     mcpRouter.use((req, res, next) => {
       const version = req.headers["mcp-protocol-version"] as string | undefined;
-      if (version !== undefined && !SUPPORTED_PROTOCOL_VERSIONS.includes(version)) {
-        res.status(400).json({ error: `Unsupported MCP-Protocol-Version: ${version}` });
+      if (
+        version === undefined ||
+        version === MCP_SESSIONLESS_PROTOCOL_VERSION ||
+        SUPPORTED_PROTOCOL_VERSIONS.includes(version)
+      ) {
+        next();
         return;
       }
-      next();
+      // An unrecognised version on a sessionless-shaped request (one carrying the
+      // `_meta` envelope) is the MCP handler's to answer: it replies with JSON-RPC
+      // `-32022` naming the revisions it does serve, which is how such a client learns
+      // what to fall back to. Answering here with a bare `{error}` body would strand
+      // that client. A sessionful-shaped request carries nothing the SDK can classify,
+      // so it is rejected here with a plain `{error}` body.
+      this.mcpHandler
+        .isSessionlessRequest(req)
+        .then((isSessionless) => {
+          if (isSessionless) {
+            next();
+            return;
+          }
+          res.status(400).json({ error: `Unsupported MCP-Protocol-Version: ${version}` });
+        })
+        .catch(next);
     });
-    mcpRouter.use(express.json({ limit: MaximumRequestSize }));
-    // eslint-disable-next-line @typescript-eslint/no-misused-promises
-    mcpRouter.all("/", async (req, res) => this.mcpHandler.handleRequest(req, res));
+    mcpRouter.all("/", (req, res, next) => {
+      this.mcpHandler.handleRequest(req, res).catch(next);
+    });
     this.api.use("/mcp", mcpRouter);
 
     this.api.use(this.publicApiExtensionRouter);
+    this.api.use(authenticationFailureLimiter);
     this.api.use(this.authenticationMiddleware.bind(this));
+
+    // A body with no Content-Type matched none of the parsers below, so `req.body` kept
+    // Express's default `{}` and a PUT wrote the two bytes "{}" over the caller's file --
+    // answering 204, so nothing looked wrong until the attachment was opened. RFC 9110
+    // says a payload with no declared type may be treated as application/octet-stream, so
+    // that is what it becomes, and the raw parser takes it from there.
+    //
+    // A *signed* PUT is routed the same way for a different reason. The upload tool
+    // advertises the destination's real media type, which for `data.json` is
+    // application/json -- so the JSON parser turned the upload into a JavaScript value
+    // and `writeFileContent` re-serialized it, storing `{"b":2,"a":1}` for a
+    // pretty-printed file and answering 204. Whitespace, key formatting and the trailing
+    // newline were simply gone. `text/*` is the same shape of problem, decoding and
+    // re-encoding bytes that were never promised to be text.
+    //
+    // A signed URL authorizes a whole-file write of exactly the bytes sent, so it does
+    // not go through a parser that can rewrite them. Doing it here rather than by
+    // changing the advertised Content-Type means the guarantee holds whatever the caller
+    // sends, instead of only when they follow the suggested command.
+    this.api.use((req, _res, next) => {
+      const hasBody =
+        req.headers["content-length"] !== undefined ||
+        req.headers["transfer-encoding"] !== undefined;
+      if (hasBody && (!req.headers["content-type"] || this.requestIsSigned(req))) {
+        req.headers["content-type"] = "application/octet-stream";
+      }
+      next();
+    });
     this.api.use(
       express.json({
         type: ContentTypes.json,
@@ -1597,9 +3170,32 @@ export default class RequestHandler {
       }),
     );
     this.api.use(
+      express.json({
+        type: ContentTypes.olrapiPatchInstruction,
+        strict: false,
+        limit: MaximumRequestSize,
+      }),
+    );
+    this.api.use(
       express.text({ type: "text/*", limit: MaximumRequestSize }),
     );
     this.api.use(express.raw({ type: "*/*", limit: MaximumRequestSize }));
+
+    // Extension sub-resources under a note (`/vault/<note>/<name>/...`). Mounted ahead
+    // of the built-in routes because `/vault/*` would otherwise match them first and 404;
+    // the dispatcher only claims a request that resolves to an existing note followed by
+    // a registered name, so every other request reaches the built-ins unchanged.
+    this.api.use(
+      this.vaultSubresources.middleware({
+        resolvePathAndTarget: (segments) => this._resolvePathAndTarget(segments),
+        getFile: (path) => {
+          const file = this.app.vault.getAbstractFileByPath(path);
+          return file instanceof TFile ? file : null;
+        },
+        getActiveFile: () => this.app.workspace.getActiveFile(),
+        isSigned: (req) => this.requestIsSigned(req),
+      }),
+    );
 
     this.api
       .route("/active/*")
@@ -1619,25 +3215,12 @@ export default class RequestHandler {
       .all((req, res, next) => {
         if (req.method === "MOVE") {
           return this.handle((rq, rs) => this.vaultMove(rq, rs))(req, res, next);
+        } else if (req.method === "COPY") {
+          return this.handle((rq, rs) => this.vaultCopy(rq, rs))(req, res, next);
         } else {
           next();
         }
       });
-
-    this.api
-      .route("/periodic/:period/:year(\\d{4})/:month(\\d{1,2})/:day(\\d{1,2})/*")
-      .get(this.handle((rq, rs) => this.periodicGet(rq, rs)))
-      .put(this.handle((rq, rs) => this.periodicPut(rq, rs)))
-      .patch(this.handle((rq, rs) => this.periodicPatch(rq, rs)))
-      .post(this.handle((rq, rs) => this.periodicPost(rq, rs)))
-      .delete(this.handle((rq, rs) => this.periodicDelete(rq, rs)));
-    this.api
-      .route("/periodic/:period/*")
-      .get(this.handle((rq, rs) => this.periodicGet(rq, rs)))
-      .put(this.handle((rq, rs) => this.periodicPut(rq, rs)))
-      .patch(this.handle((rq, rs) => this.periodicPatch(rq, rs)))
-      .post(this.handle((rq, rs) => this.periodicPost(rq, rs)))
-      .delete(this.handle((rq, rs) => this.periodicDelete(rq, rs)));
 
     this.api.route("/tags/").get(this.handle((rq, rs) => this.tagsGet(rq, rs)));
 
@@ -1645,13 +3228,22 @@ export default class RequestHandler {
     this.api.route("/commands/:commandId/").post(this.handle((rq, rs) => this.commandPost(rq, rs)));
 
     this.api.route("/search/").post(this.handle((rq, rs) => this.searchQueryPost(rq, rs)));
+
+    this.api.all(["/events/", "/events/:emitter/"], this.handle((rq, rs) => this.eventsWithoutName(rq, rs)));
+    this.api
+      .route("/events/:emitter/:event/")
+      .post(this.handle((rq, rs) => this.eventsSubscribePost(rq, rs)));
+    this.api
+      .route("/events/:emitter/:event/:id/")
+      .get(this.handle((rq, rs) => this.eventsStreamGet(rq, rs)));
     this.api.route("/search/simple/").post(this.handle((rq, rs) => this.searchSimplePost(rq, rs)));
 
     this.api.route("/open/*").post(this.handle((rq, rs) => this.openPost(rq, rs)));
 
     this.api.get(`/${CERT_NAME}`, this.handle((rq, rs) => this.certificateGet(rq, rs)));
     this.api.get("/openapi.yaml", this.handle((rq, rs) => this.openapiYamlGet(rq, rs)));
-    this.api.get("/", (rq, rs) => { this.root(rq, rs); });
+    this.api.get("/openapi.json", this.handle((rq, rs) => this.openapiJsonGet(rq, rs)));
+    this.api.get("/", this.handle((rq, rs) => this.root(rq, rs)));
 
     this.api.use(this.apiExtensionRouter);
 

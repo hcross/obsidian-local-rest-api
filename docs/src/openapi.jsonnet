@@ -1,3 +1,4 @@
+local Copy = import 'lib/copy.jsonnet';
 local Delete = import 'lib/delete.jsonnet';
 local Get = import 'lib/get.jsonnet';
 local Move = import 'lib/move.jsonnet';
@@ -5,27 +6,91 @@ local Patch = import 'lib/patch.jsonnet';
 local Post = import 'lib/post.jsonnet';
 local Put = import 'lib/put.jsonnet';
 
-local ParamDay = import 'lib/day.param.jsonnet';
-local ParamMonth = import 'lib/month.param.jsonnet';
 local ParamPath = import 'lib/path.param.jsonnet';
-local ParamPeriod = import 'lib/period.param.jsonnet';
-local ParamYear = import 'lib/year.param.jsonnet';
+local Conditional = import 'lib/conditional.jsonnet';
 
 local TargetingShared = importstr 'lib/descriptions/targeting.md';
 local GetShared = TargetingShared + '\n' + importstr 'lib/descriptions/get-shared.md';
 local PostShared = TargetingShared + '\n' + importstr 'lib/descriptions/post-shared.md';
 local PutShared = TargetingShared + '\n' + importstr 'lib/descriptions/put-shared.md';
 local PatchDescription(fileRef) =
-  'Inserts content into ' + fileRef + ' relative to a heading, block reference, or frontmatter field within that document.\n\n' + Patch.description;
+  'Modifies ' + fileRef + ' with a single structured instruction: an operation applied to a scope of a target — a heading, block reference, or frontmatter field within that document.\n\n' + Patch.description;
+
+// Signed-URL query parameters, accepted on GET and PUT /vault/{filename} while the
+// "Enable signed URLs" setting is on. Together they stand in for the bearer header.
+local SignedUrlParams = [
+  {
+    name: 'sig',
+    'in': 'query',
+    required: false,
+    description: 'Signature of a signed URL, minted by the MCP `vault_get_download_url` / `vault_get_upload_url` / `events_get_listener_url` tools or by `POST /events/{emitter}/{event}/`. Together with `exp` and `n`, authenticates this one request without an `Authorization` header. Only honoured while signed URLs are enabled in the plugin settings.',
+    schema: { type: 'string' },
+  },
+  {
+    name: 'exp',
+    'in': 'query',
+    required: false,
+    description: 'Expiry of a signed URL as Unix seconds; part of what `sig` signs.',
+    schema: { type: 'integer' },
+  },
+  {
+    name: 'n',
+    'in': 'query',
+    required: false,
+    description: 'Random per-link nonce, minted with the URL and part of what `sig` signs. Required whenever `sig` and `exp` are given: a signed request without it cannot verify. It exists so that two links minted for the same path within the same second are distinct -- `exp` has one-second granularity, so without it they would be byte-identical, and spending one would spend the other.',
+    schema: { type: 'string' },
+  },
+];
+local DownloadParam = {
+  name: 'download',
+  'in': 'query',
+  required: false,
+  description: 'On a signed-URL request, `1` asks for `Content-Disposition: attachment` (a download) instead of the `inline` disposition signed links are otherwise served with. Ignored on API-key requests, which are always served as attachments.',
+  schema: { type: 'string', enum: ['1'] },
+};
 
 local ContentLocationHeader = {
   'Content-Location': {
-    description: 'Vault-relative path of the file that was acted on, e.g. `notes/file.md`. Non-ASCII characters are percent-encoded.',
+    description: 'Vault-relative path of the file that was acted on, e.g. `notes/file.md`. Each path component is percent-encoded on its own -- non-ASCII characters, and reserved characters such as `#`, `?` and `,` that would otherwise be read as a fragment, a query or a header-list separator -- so the value can be pasted straight back into a request URL.',
     schema: { type: 'string', example: 'notes/file.md' },
   },
 };
 local WithContentLocation(codes) = {
-  responses+: { [c]+: { headers: ContentLocationHeader } for c in codes },
+  // `headers+:` rather than `headers:`: an operation's own response headers
+  // (`Markdown-Patch-Warnings`, say) must survive this being mixed in.
+  responses+: { [c]+: { headers+: ContentLocationHeader } for c in codes },
+};
+
+// `/vault/{filename}` only reports a Content-Location when the URL had to be
+// resolved -- a path that embeds a `/heading`, `/block` or `/frontmatter`
+// target is ambiguous with a file literally named that, and only the server
+// knows which way it went. A URL that names the file outright reports nothing.
+local ResolvedContentLocationHeader = {
+  'Content-Location': {
+    description: 'Vault-relative path of the file the URL resolved to, e.g. `notes/file.md`. Each path component is percent-encoded on its own -- non-ASCII characters, and reserved characters such as `#`, `?` and `,` that would otherwise be read as a fragment, a query or a header-list separator -- so the value can be pasted straight back into a request URL. Sent only when the URL embedded a target (`/heading/...`, `/block/...`, `/frontmatter/...`), since that is the case where the file the request acted on is not evident from the URL alone; absent on a whole-file request.',
+    required: false,
+    schema: { type: 'string', example: 'notes/file.md' },
+  },
+};
+local WithResolvedContentLocation(codes) = {
+  // `headers+:` rather than `headers:`: an operation's own response headers
+  // (`Markdown-Patch-Warnings`, say) must survive this being mixed in.
+  responses+: { [c]+: { headers+: ResolvedContentLocationHeader } for c in codes },
+};
+
+// Mixed into every `/vault/{filename}` operation: a path inside Obsidian's
+// configuration directory is refused for reads and writes alike unless the
+// operator opts in. `responses+:` so the operation's own responses survive.
+local ConfigDirForbidden = {
+  description: "The path is inside Obsidian's configuration directory (`app.vault.configDir`, normally `.obsidian`), which this API refuses to read or write. That directory holds plugin code and each plugin's `data.json` -- including this plugin's own, where the API key lives -- so writing there is effectively remote code execution and reading there leaks secrets (GHSA-66m9-r757-qvq7). The check is against where the path lands on disk, so a Windows 8.3 short name, a differently cased spelling, or a symlink into that directory is refused the same way. Enable 'Allow access to the configuration directory' in the plugin's Advanced settings to permit it.",
+  content: {
+    'application/json': {
+      schema: { '$ref': '#/components/schemas/Error' },
+    },
+  },
+};
+local WithConfigDirForbidden = {
+  responses+: { '403': ConfigDirForbidden },
 };
 
 
@@ -37,6 +102,14 @@ std.manifestYamlDoc(
       description: importstr 'lib/descriptions/info.md',
       version: '1.0',
     },
+    // Standalone documentation pages, rendered as sidebar articles by our
+    // customized Stoplight Elements bundle (Bump.sh's x-topics convention).
+    'x-topics': [
+      {
+        title: 'Migrating from 1.x to 2.x',
+        content: importstr 'lib/descriptions/migration-2.0.md',
+      },
+    ],
     servers: [
       {
         url: 'https://{host}:{port}',
@@ -70,14 +143,27 @@ std.manifestYamlDoc(
     components: {
       securitySchemes: {
         apiKeyAuth: {
-          description: 'Find your API Key in your Obsidian settings\nin the "Local REST API" section under "Plugins".\n',
+          description: 'Find your API Key in your Obsidian settings\nin the "Local REST API" section under "Plugins".\n\nFailed authentication is throttled. A source that presents a wrong credential -- an incorrect API key, or an invalid, expired or spent signed URL -- ten times within a minute has its further wrong credentials refused with `429` (error code `42901`) and a `Retry-After` header until the minute is up. Requests that carry the correct key or a valid signed URL are never counted or delayed, and neither are requests that present no credential at all; they are answered `401` (or, on the routes that need no authentication, served) exactly as before. The count is kept in memory per source address and does not survive a plugin reload.\n',
           type: 'http',
           scheme: 'bearer',
+        },
+      },
+      responses: {
+        TooManyAuthenticationFailures: {
+          description: 'This source has presented too many wrong credentials -- incorrect API keys, or invalid, expired or spent signed URLs -- within the current window, and this request presented another. `Retry-After` says how many seconds remain. Any route the plugin authenticates can answer this way; a request carrying the correct API key or a valid signed URL never does.',
+          headers: {
+            'Retry-After': {
+              description: 'Seconds until the window ends and wrong credentials are answered `401` again.',
+              schema: { type: 'integer' },
+            },
+          },
+          content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
         },
       },
       schemas: {
         NoteJson: {
           type: 'object',
+          description: "A note's content and metadata. `links`, `backlinks`, and `unresolvedLinks` reflect Obsidian's metadata cache as it stands when the note is read, and may be incomplete while Obsidian is still indexing the vault after startup. To tell indexing from idle, watch the `metadataCache` event stream (`resolve` fires per file, `resolved` on each drain of the resolver queue) or read `state.metadataCache` from `GET /`, which reports when the plugin last heard either.",
           required: [
             'tags',
             'frontmatter',
@@ -86,6 +172,7 @@ std.manifestYamlDoc(
             'content',
             'links',
             'backlinks',
+            'unresolvedLinks',
           ],
           properties: {
             tags: {
@@ -124,17 +211,29 @@ std.manifestYamlDoc(
             },
             links: {
               type: 'array',
-              description: 'Vault-relative paths of files this file links to.',
+              description: "Vault-relative paths of files this file links to, as Obsidian's cache currently has them; see the schema description.",
               items: {
                 type: 'string',
               },
             },
             backlinks: {
               type: 'array',
-              description: 'Vault-relative paths of files that link to this file.',
+              description: "Vault-relative paths of files that link to this file, as Obsidian's cache currently has them; see the schema description.",
               items: {
                 type: 'string',
               },
+            },
+            unresolvedLinks: {
+              type: 'array',
+              description: "Link text found in this file that does not resolve to an existing vault file, as Obsidian's cache currently has it; see the schema description.",
+              items: {
+                type: 'string',
+              },
+            },
+            version: {
+              type: 'string',
+              description: 'The file\'s version token, computed from the `content` returned beside it: the same value as its `ETag` and its document map\'s `version`. Send it as `If-Match` (quoted or bare) on a write to make the write fail, rather than overwrite a change made in between, if the file has changed.',
+              example: 'a1b2c3',
             },
           },
         },
@@ -153,6 +252,42 @@ std.manifestYamlDoc(
             },
           },
         },
+        HeadingAddress: {
+          description: |||
+            A heading address: the path of heading texts from the top level down
+            to the target. Use `null` or `[]` for the document root.
+          |||,
+          oneOf: [
+            { type: 'array', items: { type: 'string' } },
+            { type: 'null' },
+          ],
+        },
+        HeadingTree: {
+          type: 'object',
+          description: |||
+            The document's headings nested by containment: each heading's text
+            maps to a HeadingTree of its child headings, and a leaf heading maps
+            to `{}`. Nesting carries no heading level — a level skipped in the
+            source leaves no hole. To target a heading, use the path of keys from
+            the top level down to it as a HeadingAddress.
+
+            A repeated sibling heading appears once, but its children are not
+            lost: they merge into that one key, because a heading is addressed by
+            its whole path rather than its name. Given `## Log / ### Monday`
+            followed by `## Log / ### Tuesday`, the tree is
+            `{"Log": {"Monday": {}, "Tuesday": {}}}` and both are separately
+            addressable. Only sections that share an entire path are one address,
+            and that address resolves to the first in document order. The tree
+            therefore lists exactly the headings you can target.
+          |||,
+          additionalProperties: { '$ref': '#/components/schemas/HeadingTree' },
+          example: { Overview: { Details: {} }, Appendix: {} },
+        },
+        // Generated from markdown-patch-2's published Zod schema by
+        // scripts/gen-patch-schema.mjs (run via `npm run build-docs`), so the
+        // REST docs, the MCP tool input, and the engine's validation are one
+        // definition. Edit the Zod schema, not this component.
+        PatchInstruction: import 'lib/patchInstruction.schema.json',
       },
     },
     security: [
@@ -163,10 +298,11 @@ std.manifestYamlDoc(
     tags: [
       { name: 'Vault Files' },
       { name: 'Active File' },
-      { name: 'Periodic Notes' },
       { name: 'Vault Directories' },
+      { name: 'Tags' },
       { name: 'Search' },
       { name: 'Commands' },
+      { name: 'Events' },
       { name: 'Open' },
       { name: 'System' },
       { name: 'MCP' },
@@ -177,80 +313,83 @@ std.manifestYamlDoc(
           tags: ['Active File'],
           summary: 'Return the content of the active file open in Obsidian.\n',
           description: (importstr 'lib/descriptions/active-get.md') + '\n' + GetShared,
-        },
+        } + Conditional.Read(['200']),
         put: Put + WithContentLocation(['200', '204']) {
           tags: [
             'Active File',
           ],
           summary: 'Update the content of the active file open in Obsidian.\n',
           description: PutShared,
-        },
+        } + Conditional.Write(['200', '204']),
         post: Post + WithContentLocation(['200', '204']) {
           tags: [
             'Active File',
           ],
           summary: 'Append content to the active file open in Obsidian.\n',
           description: (importstr 'lib/descriptions/active-post.md') + '\n' + PostShared,
-        },
+        } + Conditional.Write(['200', '204']),
         patch: Patch + WithContentLocation(['200']) {
           tags: [
             'Active File',
           ],
           summary: 'Partially update content in the currently open note.\n',
           description: PatchDescription('the currently-open note'),
-        },
+        } + Conditional.Write(['200']),
         delete: Delete + WithContentLocation(['204']) {
           tags: [
             'Active File',
           ],
           summary: 'Deletes the currently-active file in Obsidian.\n',
-        },
+        } + Conditional.Write([], [Conditional.ifMatch]),
       },
       '/vault/{filename}': {
-        get: Get {
+        get: Get + WithResolvedContentLocation(['200']) + WithConfigDirForbidden {
           tags: [
             'Vault Files',
           ],
           summary: 'Return the content of a single file in your vault.\n',
           description: (importstr 'lib/descriptions/vault-file-get.md') + '\n' + GetShared,
-          parameters: [ParamPath] + super.parameters,
-        },
-        put: Put {
+          parameters: [ParamPath] + super.parameters + SignedUrlParams + [DownloadParam],
+        } + Conditional.Read(['200']),
+        put: Put + WithResolvedContentLocation(['200']) + WithConfigDirForbidden {
           tags: [
             'Vault Files',
           ],
           summary: 'Create a new file in your vault or update the content of an existing one.\n',
-          description: 'Creates a new file in your vault or updates the content of an existing one if the specified file already exists.\n\n' + PutShared,
-          parameters: [ParamPath] + super.parameters,
-        },
-        post: Post {
+          description: 'Creates a new file in your vault or updates the content of an existing one if the specified file already exists.\n\nAny content type is accepted: a request body that is not text or JSON is stored as raw bytes, so attachments -- images, PDFs, audio -- can be uploaded here as well as notes. A body sent with no `Content-Type` at all is treated as `application/octet-stream` and stored as raw bytes, which is what RFC 9110 allows. There is no size limit beyond the request-size cap.\n\nA signed upload URL (`?sig=…&exp=…&n=…`, from the MCP `vault_get_upload_url` tool) authenticates a single whole-file `PUT` in place of the `Authorization` header; the link is consumed by the request that succeeds. A signed `PUT` stores exactly the bytes sent, whatever `Content-Type` it declares -- it is not routed through the JSON or text parsers, which would otherwise reparse and re-serialize the body. It authorizes a whole-file write only: a request that also targets part of the document, through `Target-Type`/`Target` headers or through `/heading`, `/block` or `/frontmatter` path elements, is refused.\n\n' + PutShared,
+          parameters: [ParamPath] + super.parameters + SignedUrlParams,
+        } + Conditional.Write(['200', '204']),
+        post: Post + WithResolvedContentLocation(['200']) + WithConfigDirForbidden {
           tags: [
             'Vault Files',
           ],
           summary: 'Append content to a new or existing file.\n',
           description: (importstr 'lib/descriptions/vault-file-post.md') + '\n' + PostShared,
           parameters: [ParamPath] + super.parameters,
-        },
-        patch: Patch {
+        } + Conditional.Write(['200', '204']),
+        patch: Patch + WithResolvedContentLocation(['200']) + WithConfigDirForbidden {
           tags: [
             'Vault Files',
           ],
           summary: 'Partially update content in an existing note.\n',
           description: PatchDescription('an existing note'),
           parameters: [ParamPath] + super.parameters,
-        },
+        } + Conditional.Write(['200']),
         additionalOperations: {
-          move: Move {
+          move: Move + WithConfigDirForbidden {
             parameters: Move.parameters + [ParamPath],
-          },
+          } + Conditional.Write([], [Conditional.ifMatch]),
+          copy: Copy + WithConfigDirForbidden {
+            parameters: Copy.parameters + [ParamPath],
+          } + Conditional.Write([], [Conditional.ifMatch]),
         },
-        delete: Delete {
+        delete: Delete + WithConfigDirForbidden {
           tags: [
             'Vault Files',
           ],
           summary: 'Delete a particular file in your vault.\n',
           parameters: Delete.parameters + [ParamPath],
-        },
+        } + Conditional.Write([], [Conditional.ifMatch]),
       },
       '/vault/': {
         get: {
@@ -351,89 +490,6 @@ std.manifestYamlDoc(
               },
             },
           },
-        },
-      },
-      '/periodic/{period}/': {
-        get: Get + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Get current periodic note for the specified period.\n',
-          description: (importstr 'lib/descriptions/periodic-current-get.md') + '\n' + GetShared,
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        put: Put + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Update the content of the current periodic note for the specified period.\n',
-          description: PutShared,
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        post: Post + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Append content to the current periodic note for the specified period.\n',
-          description: (importstr 'lib/descriptions/periodic-current-post.md') + '\n' + PostShared,
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        patch: Patch + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Partially update content in the current periodic note for the specified period.\n',
-          description: PatchDescription('the current periodic note for the specified period'),
-          parameters: [ParamPeriod] + super.parameters,
-        },
-        delete: Delete + WithContentLocation(['204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Delete the current periodic note for the specified period.\n',
-          parameters+: [ParamPeriod],
-        },
-      },
-      '/periodic/{period}/{year}/{month}/{day}/': {
-        get: Get + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Get the periodic note for the specified period and date.\n',
-          description: (importstr 'lib/descriptions/periodic-date-get.md') + '\n' + GetShared,
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        put: Put + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Update the content of the periodic note for the specified period and date.\n',
-          description: PutShared,
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        post: Post + WithContentLocation(['200', '204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Append content to the periodic note for the specified period and date.\n',
-          description: (importstr 'lib/descriptions/periodic-date-post.md') + '\n' + PostShared,
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        patch: Patch + WithContentLocation(['200']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Partially update content in the periodic note for the specified period and date.\n',
-          description: PatchDescription('a periodic note for the specified period and date'),
-          parameters: [ParamYear, ParamMonth, ParamDay, ParamPeriod] + super.parameters,
-        },
-        delete: Delete + WithContentLocation(['204']) {
-          tags: [
-            'Periodic Notes',
-          ],
-          summary: 'Delete the periodic note for the specified period and date.\n',
-          description: 'Deletes the periodic note for the specified period.\n',
-          parameters+: [ParamYear, ParamMonth, ParamDay, ParamPeriod],
         },
       },
       '/tags/': {
@@ -595,6 +651,10 @@ std.manifestYamlDoc(
                     summary: 'Find notes having a certain tag',
                     value: '{\n  "in": [\n    "myTag",\n    {"var": "tags"}\n  ]\n}\n',
                   },
+                  find_missing_frontmatter_field: {
+                    summary: 'Find notes that do not have a certain frontmatter field (a field that is blank or an empty string counts as not present)',
+                    value: '{\n  "missing": ["frontmatter.myField"]\n}\n',
+                  },
                 },
               },
             },
@@ -602,6 +662,12 @@ std.manifestYamlDoc(
           responses: {
             '200': {
               description: 'Success',
+              headers: {
+                'X-Obsidian-Search-Truncated': {
+                  description: 'Present, with the value `true`, only when the search stopped early at the file or time limit (see "Search limits" above), so the list may be incomplete.',
+                  schema: { type: 'string', 'enum': ['true'] },
+                },
+              },
               content: {
                 'application/json': {
                   schema: {
@@ -682,10 +748,36 @@ std.manifestYamlDoc(
                 default: 100,
               },
             },
+            {
+              name: 'maxResults',
+              'in': 'query',
+              description: 'The most files to return. The highest-scoring files are kept, and the `Total-Results` header gives how many matched in all. Unlimited when absent.',
+              required: false,
+              schema: {
+                type: 'integer',
+                minimum: 1,
+              },
+            },
+            {
+              name: 'maxMatchesPerFile',
+              'in': 'query',
+              description: "The most matches to return for each file, in document order. Each file's `totalMatches` gives how many it had in all. Unlimited when absent. Obsidian's simple search matches each word of the query separately, so a query containing a common word can match thousands of times in a single file; this is what keeps such a result a manageable size.",
+              required: false,
+              schema: {
+                type: 'integer',
+                minimum: 1,
+              },
+            },
           ],
           responses: {
             '200': {
               description: 'Success',
+              headers: {
+                'Total-Results': {
+                  description: 'How many files matched in all. Larger than the number of items returned when `maxResults` left some out.',
+                  schema: { type: 'integer' },
+                },
+              },
               content: {
                 'application/json': {
                   schema: {
@@ -699,6 +791,10 @@ std.manifestYamlDoc(
                         },
                         score: {
                           type: 'number',
+                        },
+                        totalMatches: {
+                          type: 'number',
+                          description: 'How many matches the file had in all. Larger than the length of `matches` when `maxMatchesPerFile` left some out.',
                         },
                         matches: {
                           type: 'array',
@@ -735,6 +831,160 @@ std.manifestYamlDoc(
                   },
                 },
               },
+            },
+            '400': {
+              description: 'No `query` parameter, or a `maxResults` or `maxMatchesPerFile` that is not a single positive integer.',
+              content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
+            },
+          },
+        },
+      },
+      '/events/{emitter}/{event}/': {
+        parameters: [
+          {
+            name: 'emitter',
+            'in': 'path',
+            required: true,
+            description: "The Obsidian object whose event to follow (`vault`, `metadataCache`, `workspace`), or the plugin id of an extension that registered events.",
+            schema: { type: 'string' },
+          },
+          {
+            name: 'event',
+            'in': 'path',
+            required: true,
+            description: "The event's name, one of those listed for the emitter: Obsidian's own name for a built-in emitter, or the name the extension registered it under.",
+            schema: { type: 'string' },
+          },
+        ],
+        post: {
+          tags: ['Events'],
+          summary: 'Subscribe to an Obsidian event as a Server-Sent Events stream\n',
+          description: importstr 'lib/descriptions/events.md',
+          parameters: [
+            {
+              name: 'ttl',
+              'in': 'query',
+              required: false,
+              description: "How long the stream URL stays valid, in seconds; clamped to 10-86400. Defaults to the plugin's signed-URL lifetime.",
+              schema: { type: 'integer' },
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/vnd.olrapi.jsonlogic+json': {
+                schema: {
+                  type: 'object',
+                  externalDocs: { url: 'https://jsonlogic.com/operations.html' },
+                },
+                examples: {
+                  notes_in_folder: {
+                    summary: 'Only files under journal/.',
+                    value: '{"glob": ["journal/*", {"var": "path"}]}\n',
+                  },
+                  frontmatter_value: {
+                    summary: 'Only notes whose status is done (use with metadataCache/changed).',
+                    value: '{"==": [{"var": "file.frontmatter.status"}, "done"]}\n',
+                  },
+                },
+              },
+              'application/json': {
+                schema: { type: 'object' },
+              },
+            },
+          },
+          responses: {
+            '201': {
+              description: 'Subscription registered.',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['id', 'emitter', 'event', 'url', 'signed', 'expiresAt'],
+                    properties: {
+                      id: { type: 'string', description: 'The subscription id.' },
+                      emitter: { type: 'string' },
+                      event: { type: 'string' },
+                      url: {
+                        type: 'string',
+                        description: 'The stream to open with GET. Signed when signed URLs are enabled.',
+                      },
+                      signed: {
+                        type: 'boolean',
+                        description: 'Whether `url` carries a signature, or needs the API key.',
+                      },
+                      expiresAt: {
+                        type: 'string',
+                        format: 'date-time',
+                        description: 'After this, the stream can no longer be opened; one already open stays open.',
+                      },
+                    },
+                  },
+                },
+              },
+            },
+            '400': {
+              description: 'No event named (`/events/` or `/events/{emitter}/`), a filter JsonLogic cannot evaluate, or a body that is not JSON.',
+              content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
+            },
+            '404': {
+              description: 'The emitter or event cannot be streamed. The body lists what can, as `supportedEvents`.',
+              content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
+            },
+            '503': {
+              description: 'Too many subscriptions exist.',
+              content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
+            },
+          },
+        },
+      },
+      '/events/{emitter}/{event}/{subscriptionId}/': {
+        get: {
+          tags: ['Events'],
+          summary: 'Open the Server-Sent Events stream of a subscription\n',
+          description: |||
+            Streams the subscription's events as `text/event-stream`, with a keep-alive comment every 15 seconds, until the client disconnects or the plugin reloads. See `POST /events/{emitter}/{event}/` for what each message carries.
+
+            Authenticates with the API key, or with the `sig`, `exp` and `n` parameters of the URL that registering the subscription returned. A stream opened before the subscription expires stays open after it.
+          |||,
+          parameters: [
+            {
+              name: 'emitter',
+              'in': 'path',
+              required: true,
+              schema: { type: 'string' },
+            },
+            { name: 'event', 'in': 'path', required: true, schema: { type: 'string' } },
+            {
+              name: 'subscriptionId',
+              'in': 'path',
+              required: true,
+              description: 'The `id` returned when the subscription was registered.',
+              schema: { type: 'string' },
+            },
+          ] + SignedUrlParams,
+          responses: {
+            '200': {
+              description: 'The event stream.',
+              content: {
+                'text/event-stream': {
+                  schema: { type: 'string' },
+                  example: 'event: modify\nid: 3f9a1c2e-7\ndata: {"emitter":"vault","event":"modify","path":"journal/today.md","isFolder":false,"file":{"path":"journal/today.md","tags":[],"frontmatter":{},"stat":{"ctime":1705276800000,"mtime":1705363200000,"size":1024},"links":[],"backlinks":[],"unresolvedLinks":[]}}\n\n',
+                },
+              },
+            },
+            '401': {
+              description: 'No API key, and no valid signature for this subscription.',
+              content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
+            },
+            '429': { '$ref': '#/components/responses/TooManyAuthenticationFailures' },
+            '404': {
+              description: 'No such subscription for this emitter and event, or it has expired.',
+              content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
+            },
+            '503': {
+              description: 'Too many streams are open.',
+              content: { 'application/json': { schema: { '$ref': '#/components/schemas/Error' } } },
             },
           },
         },
@@ -780,7 +1030,7 @@ std.manifestYamlDoc(
             'System',
           ],
           summary: 'Returns basic details about the server.\n',
-          description: 'Returns basic details about the server as well as your authentication status.\n\nThis is the only API request that does *not* require authentication.\n',
+          description: importstr 'lib/descriptions/root-get.md',
           responses: {
             '200': {
               description: 'Success',
@@ -788,8 +1038,9 @@ std.manifestYamlDoc(
                 'application/json': {
                   schema: {
                     type: 'object',
+                    required: ['status', 'versions', 'service', 'authenticated'],
                     properties: {
-                      ok: {
+                      status: {
                         type: 'string',
                         description: "'OK'",
                       },
@@ -814,11 +1065,95 @@ std.manifestYamlDoc(
                         type: 'boolean',
                         description: 'Is your current request authenticated?',
                       },
+                      certificateInfo: {
+                        type: 'object',
+                        description: 'Authenticated requests only. Facts about the certificate the HTTPS server presents.',
+                        required: ['validityDays', 'regenerateRecommended', 'regenerateReason'],
+                        properties: {
+                          validityDays: {
+                            type: 'number',
+                            description: 'Days until the certificate expires.',
+                          },
+                          regenerateRecommended: {
+                            type: 'boolean',
+                            description: 'Whether the certificate material predates a standard the plugin now follows and should be regenerated from the settings tab.',
+                          },
+                          regenerateReason: {
+                            type: ['string', 'null'],
+                            description: 'Why regeneration is recommended, or null when it is not. `ca-used-as-leaf` means the installation still serves a single self-signed certificate generated before the plugin began issuing a separate certificate authority.',
+                          },
+                        },
+                      },
+                      apiExtensions: {
+                        type: 'array',
+                        description: 'Authenticated requests only. Every plugin registered with the extension API: its manifest, plus the routes and MCP tools it has added.',
+                        items: {
+                          type: 'object',
+                          required: ['id', 'name', 'version', 'routes', 'mcpTools'],
+                          properties: {
+                            id: { type: 'string' },
+                            name: { type: 'string' },
+                            version: { type: 'string' },
+                            routes: {
+                              type: 'array',
+                              items: {
+                                type: 'object',
+                                required: ['path', 'authenticated'],
+                                properties: {
+                                  path: { type: 'string' },
+                                  authenticated: {
+                                    type: 'boolean',
+                                    description: 'Whether the route requires the API key.',
+                                  },
+                                },
+                              },
+                            },
+                            mcpTools: {
+                              type: 'array',
+                              items: { type: 'string' },
+                            },
+                          },
+                        },
+                      },
+                      state: {
+                        type: 'object',
+                        description: "Authenticated requests only. Observations, by namespace, that a client reads to decide whether to proceed; the server attaches no verdict. `metadataCache` is the plugin's own. Every other key is an extension plugin's id and holds whatever that extension chose to publish, or null when its state could not be read in time (the budget is a plugin setting, 100 ms by default). An extension that documents its state appears here as a named property of this object.",
+                        required: ['metadataCache'],
+                        properties: {
+                          metadataCache: {
+                            type: 'object',
+                            description: "What the plugin has heard from Obsidian's metadata cache since it loaded. Obsidian gives no documented signal for the end of startup link resolution, so these are timestamps rather than a `ready` flag: indexing in progress looks like recent activity, and done looks like silence. A plugin enabled into an already-indexed vault hears nothing at all, which is why `listeningSince` is reported alongside. A client's rule might be: wait while `lastResolvedAt` is null and `listeningSince` is recent, or while `lastActivityAt` is recent.",
+                            required: ['listeningSince', 'lastResolvedAt', 'lastActivityAt'],
+                            properties: {
+                              listeningSince: {
+                                type: 'string',
+                                format: 'date-time',
+                                description: 'When the plugin attached its listeners, which is when it loaded. The other two fields describe the window starting here.',
+                              },
+                              lastResolvedAt: {
+                                type: ['string', 'null'],
+                                format: 'date-time',
+                                description: "When the plugin last heard the metadata cache's `resolved` event, which Obsidian fires each time its link resolver queue drains, or null if it has not since `listeningSince`.",
+                              },
+                              lastActivityAt: {
+                                type: ['string', 'null'],
+                                format: 'date-time',
+                                description: "When the plugin last heard any indexing activity from the metadata cache (`changed`, `resolve`, or `resolved`), or null if none since `listeningSince`.",
+                              },
+                            },
+                          },
+                        },
+                        additionalProperties: {
+                          type: ['object', 'null'],
+                          description: "An extension plugin's state, under its plugin id, or null when it could not be read.",
+                        },
+                      },
                     },
                   },
                 },
               },
             },
+            '429': { '$ref': '#/components/responses/TooManyAuthenticationFailures' },
           },
         },
       },
@@ -828,6 +1163,7 @@ std.manifestYamlDoc(
             'System',
           ],
           summary: 'Returns OpenAPI YAML document describing the capabilities of this API.\n',
+          description: "Includes the routes of any installed extension plugin that describes them. Each path an extension contributes carries an `x-obsidian-extension` field naming that extension's plugin ID.\n",
           responses: {
             '200': {
               description: 'Success',
@@ -835,11 +1171,32 @@ std.manifestYamlDoc(
           },
         },
       },
+      '/openapi.json': {
+        get: {
+          tags: [
+            'System',
+          ],
+          summary: 'Returns the OpenAPI document describing the capabilities of this API, as JSON.\n',
+          description: 'The same document as `/openapi.yaml`, including the routes that extension plugins describe.\n',
+          responses: {
+            '200': {
+              description: 'Success',
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
       '/mcp/': {
         get: {
           tags: ['MCP'],
-          summary: 'Open a server-sent events stream for an existing MCP session.\n',
-          description: 'Opens a long-lived SSE stream so the server can push messages to the client for an existing session. Requires the session ID returned by the `initialize` response.\n',
+          summary: 'Open a server-sent events stream for an existing sessionful MCP session.\n',
+          description: 'Opens a long-lived SSE stream so the server can push messages to the client for an existing session. Requires the session ID returned by the `initialize` response. This is a session operation of the sessionful protocol revisions (`2024-10-07` through `2025-11-25`); the `2026-07-28` revision removed it, and clients on that revision open a `subscriptions/listen` stream over POST instead.\n',
           parameters: [
             {
               name: 'Mcp-Session-Id',
@@ -853,7 +1210,7 @@ std.manifestYamlDoc(
             {
               name: 'MCP-Protocol-Version',
               'in': 'header',
-              description: 'MCP protocol version negotiated during initialization (e.g. `2025-06-18`). Required on all requests after initialization. Unrecognised values are rejected with 400.',
+              description: 'MCP protocol version negotiated during initialization (e.g. `2025-06-18`). Unrecognised values are rejected with 400.',
               required: false,
               schema: {
                 type: 'string',
@@ -901,6 +1258,7 @@ std.manifestYamlDoc(
                 },
               },
             },
+            '429': { '$ref': '#/components/responses/TooManyAuthenticationFailures' },
           },
         },
         post: {
@@ -911,7 +1269,7 @@ std.manifestYamlDoc(
             {
               name: 'Mcp-Session-Id',
               'in': 'header',
-              description: 'Session ID returned by the server on initialization. Omit for the initial `initialize` request; required for all subsequent requests.',
+              description: 'Session ID returned by the server on initialization. A session operation of the sessionful protocol revisions (`2024-10-07` through `2025-11-25`): omit it for the initial `initialize` request, send it on every later request of that session, and expect 404 if the session has ended. The `2026-07-28` revision has no sessions — the header is neither issued nor read there.',
               required: false,
               schema: {
                 type: 'string',
@@ -920,7 +1278,25 @@ std.manifestYamlDoc(
             {
               name: 'MCP-Protocol-Version',
               'in': 'header',
-              description: 'MCP protocol version negotiated during initialization (e.g. `2025-06-18`). Required on all requests after initialization. Unrecognised values are rejected with 400.',
+              description: 'Protocol revision this request speaks. Required on every request on the `2026-07-28` revision, where it must match `params._meta["io.modelcontextprotocol/protocolVersion"]`; on the sessionful revisions it carries the version negotiated during `initialize` (e.g. `2025-06-18`). Unrecognised values are rejected with 400.',
+              required: false,
+              schema: {
+                type: 'string',
+              },
+            },
+            {
+              name: 'Mcp-Method',
+              'in': 'header',
+              description: 'The JSON-RPC method named in the request body. Required on `2026-07-28` requests; a value that disagrees with the body is rejected with 400 and JSON-RPC error `-32020`.',
+              required: false,
+              schema: {
+                type: 'string',
+              },
+            },
+            {
+              name: 'Mcp-Name',
+              'in': 'header',
+              description: 'The primary subject named in the request body — `params.name` for `tools/call` and `prompts/get`, `params.uri` for `resources/read`. Required on `2026-07-28` requests that carry one; a value that disagrees with the body is rejected with 400 and JSON-RPC error `-32020`.',
               required: false,
               schema: {
                 type: 'string',
@@ -949,6 +1325,7 @@ std.manifestYamlDoc(
                       type: 'string',
                       description: 'MCP method to invoke.',
                       enum: [
+                        'server/discover',
                         'initialize',
                         'tools/list',
                         'tools/call',
@@ -966,13 +1343,34 @@ std.manifestYamlDoc(
                   },
                 },
                 examples: {
-                  list_tools: {
-                    summary: 'List all available MCP tools',
+                  discover: {
+                    summary: 'Discover the supported protocol revisions and capabilities (2026-07-28)',
                     value: {
                       jsonrpc: '2.0',
                       id: 1,
+                      method: 'server/discover',
+                      params: {
+                        _meta: {
+                          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+                          'io.modelcontextprotocol/clientInfo': { name: 'my-client', version: '1.0.0' },
+                          'io.modelcontextprotocol/clientCapabilities': {},
+                        },
+                      },
+                    },
+                  },
+                  list_tools: {
+                    summary: 'List all available MCP tools (2026-07-28)',
+                    value: {
+                      jsonrpc: '2.0',
+                      id: 2,
                       method: 'tools/list',
-                      params: {},
+                      params: {
+                        _meta: {
+                          'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+                          'io.modelcontextprotocol/clientInfo': { name: 'my-client', version: '1.0.0' },
+                          'io.modelcontextprotocol/clientCapabilities': {},
+                        },
+                      },
                     },
                   },
                   call_vault_read: {
@@ -1000,7 +1398,7 @@ std.manifestYamlDoc(
                         arguments: {
                           path: 'path/to/note.md',
                           targetType: 'heading',
-                          target: 'My Section',
+                          target: ['My Section'],
                           operation: 'append',
                           content: 'New line of content\n',
                         },
@@ -1024,10 +1422,10 @@ std.manifestYamlDoc(
           },
           responses: {
             '200': {
-              description: 'Message handled. Response body contains the JSON-RPC result, or may be empty for notifications. On session initialization the `Mcp-Session-Id` response header contains the new session ID.',
+              description: 'Message handled. The body is either a single JSON-RPC response (`application/json`) or a server-sent event stream carrying request-scoped notifications followed by the response (`text/event-stream`); notifications are answered with `202 Accepted` and no body. On a sessionful-revision `initialize` the `Mcp-Session-Id` response header carries the new session ID; `2026-07-28` requests are served without one.',
               headers: {
                 'Mcp-Session-Id': {
-                  description: 'Session ID assigned by the server. Present only on the `initialize` response.',
+                  description: 'Session ID assigned by the server. Present only on a sessionful-revision `initialize` response.',
                   schema: {
                     type: 'string',
                   },
@@ -1035,17 +1433,7 @@ std.manifestYamlDoc(
               },
             },
             '400': {
-              description: 'Unsupported MCP-Protocol-Version.',
-              content: {
-                'application/json': {
-                  schema: {
-                    '$ref': '#/components/schemas/Error',
-                  },
-                },
-              },
-            },
-            '404': {
-              description: 'Session not found.',
+              description: 'Unsupported `MCP-Protocol-Version`, or — on the `2026-07-28` revision — a JSON-RPC error response carrying `-32020` (headers disagree with the body), `-32022` (unsupported protocol version), or `-32602` (malformed `_meta` envelope).',
               content: {
                 'application/json': {
                   schema: {
@@ -1064,6 +1452,17 @@ std.manifestYamlDoc(
                 },
               },
             },
+            '429': { '$ref': '#/components/responses/TooManyAuthenticationFailures' },
+            '404': {
+              description: 'Session not found. The `Mcp-Session-Id` header names a session that has ended; hand-shake again with `initialize`.',
+              content: {
+                'application/json': {
+                  schema: {
+                    '$ref': '#/components/schemas/Error',
+                  },
+                },
+              },
+            },
           },
         },
       },
@@ -1072,7 +1471,14 @@ std.manifestYamlDoc(
           tags: [
             'System',
           ],
-          summary: 'Returns the certificate in use by this API.\n',
+          summary: 'Returns the certificate to trust in order to connect to this API.\n',
+          description: |||
+            Returns, in PEM format, the certificate authority that signed the certificate the HTTPS server presents; import this as a trusted authority in your OS, browser, or HTTP client to connect without certificate warnings.
+
+            The authority carries a critical `nameConstraints` extension permitting only `127.0.0.1`, `localhost`, the configured binding host, and the configured subject alternative names, so trusting it grants it no authority over other hostnames.
+
+            Installations still running certificate material generated before the plugin began issuing a separate certificate authority return their single self-signed certificate instead. The authenticated `GET /` response's `certificateInfo.regenerateReason` reports `ca-used-as-leaf` in that case.
+          |||,
           responses: {
             '200': {
               description: 'Success',

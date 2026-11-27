@@ -1,9 +1,7 @@
-// eslint-disable-next-line no-restricted-imports -- Moment type is not re-exported by 'obsidian'; import type causes no runtime bundling
-import type { Moment } from "moment";
 import { FileStats, TFile } from "obsidian";
-import { IPeriodicNoteSettings } from "obsidian-daily-notes-interface";
 
 export enum ErrorCode {
+  InvalidFrontmatter = 40005,
   TextContentEncodingRequired = 40010,
   ContentTypeSpecificationRequired = 40011,
   InvalidContentType = 40012,
@@ -11,6 +9,8 @@ export enum ErrorCode {
   MissingDestinationHeader = 40020,
   PathTraversalNotAllowed = 40021,
   InvalidDestinationHeader = 40022,
+  InvalidWithinHeader = 40023,
+  InvalidPreconditionHeader = 40024,
   MissingTargetTypeHeader = 40053,
   InvalidTargetTypeHeader = 40054,
   MissingTargetHeader = 40055,
@@ -18,27 +18,50 @@ export enum ErrorCode {
   MissingOperation = 40056,
   InvalidOperation = 40057,
   InvalidTargetHeader = 40058,
-  PeriodIsNotEnabled = 40060,
+  InvalidPatchVersionHeader = 40082,
+  HeaderTargetingRequiresVersion1 = 40083,
+  PatchHeaderTargetingRequiresExplicitVersion = 40084,
   InvalidFilterQuery = 40070,
   PatchFailed = 40080,
+  InvalidPatchInstruction = 40081,
   InvalidSearch = 40090,
+  EventNameRequired = 40095,
   ApiKeyAuthorizationRequired = 40101,
-  PeriodDoesNotExist = 40460,
-  PeriodicNoteDoesNotExist = 40461,
+  SignedUrlIsWholeFileOnly = 40102,
+  ConfigDirAccessNotAllowed = 40321,
+  UnknownEvent = 40460,
+  EventSubscriptionNotFound = 40461,
   RequestMethodValidOnlyForFiles = 40510,
   DestinationAlreadyExists = 40920,
+  PreconditionFailed = 41200,
   ConflictingTargetSpecification = 42200,
+  TooManyAuthenticationFailures = 42901,
   ErrorPreparingSimpleSearch = 50010,
   FileOperationFailed = 50020,
+  EventCapacityReached = 50301,
+}
+
+/**
+ * The TLS material the plugin serves.
+ *
+ * `cert`/`privateKey`/`publicKey` are the leaf certificate presented by the
+ * HTTPS server and its keypair. `caCert`/`caPrivateKey` hold the certificate
+ * authority that signed the leaf; they are absent for material generated
+ * before the CA/leaf split (a single self-signed certificate that doubled as
+ * its own authority), which the plugin keeps serving unchanged until the
+ * user regenerates it.
+ */
+export interface CryptoSettings {
+  cert: string;
+  privateKey: string;
+  publicKey: string;
+  caCert?: string;
+  caPrivateKey?: string;
 }
 
 export interface LocalRestApiSettings {
   apiKey?: string;
-  crypto?: {
-    cert: string;
-    privateKey: string;
-    publicKey: string;
-  };
+  crypto?: CryptoSettings;
   port: number;
   insecurePort: number;
   enableInsecureServer: boolean;
@@ -48,14 +71,41 @@ export interface LocalRestApiSettings {
   bindingHost?: string;
   subjectAltNames?: string;
   enableVerboseLogging?: boolean;
-}
 
-export interface PeriodicNoteInterface {
-  settings: IPeriodicNoteSettings;
-  loaded: boolean;
-  create: (date: Moment) => Promise<TFile>;
-  get: (date: Moment, all: Record<string, TFile>) => TFile;
-  getAll: () => Record<string, TFile>;
+  /**
+   * Whether `GET`/`PUT /vault/<path>` accept a signed URL in place of the bearer
+   * header, and whether the MCP tools that mint such URLs are registered. On by
+   * default (see `DEFAULT_SETTINGS`); a stored `false` turns it off. A signed link is a
+   * capability that can be pasted anywhere, which is why it can be turned off at all.
+   */
+  enableSignedUrls?: boolean;
+  /** How long a signed URL stays valid, in seconds. See `clampSignedUrlTtl`. */
+  signedUrlTtlSeconds?: number;
+
+  /**
+   * How long `GET /` waits for an extension's state before serving null for it, in
+   * milliseconds. See `clampStateReadTimeout`; absent means the default.
+   */
+  stateReadTimeoutMs?: number;
+
+  /**
+   * Whether the API may read or write files inside Obsidian's configuration
+   * directory (`app.vault.configDir`, normally `.obsidian`). Off by default and
+   * absent unless explicitly turned on.
+   *
+   * That directory holds plugin code, `community-plugins.json`, and each
+   * plugin's `data.json` -- including this plugin's own, where the API key
+   * lives. Writing into it is arbitrary code execution: Obsidian `eval`s an
+   * enabled plugin's `main.js`, so an authenticated client that can drop a
+   * plugin there and enable it runs code at full user privilege (GHSA-66m9-r757-qvq7).
+   * Reading from it leaks those same secrets. The guard therefore covers reads
+   * as well as writes.
+   *
+   * It exists as a setting at all because a few users deliberately manage their
+   * config through the API; turning it on re-grants that access and, with it,
+   * the risk above.
+   */
+  enableConfigDirAccess?: boolean;
 }
 
 declare module "obsidian" {
@@ -88,8 +138,10 @@ declare module "obsidian" {
       plugins: {
         [key: string]: PluginManifest;
       };
+      getPlugin(id: string): { settings?: Record<string, unknown> } | null;
     };
     internalPlugins: {
+      getPluginById(id: string): { instance?: { options?: Record<string, unknown> } } | null;
       plugins: {
         [key: string]: {
           instance: {
@@ -142,6 +194,26 @@ export interface SearchResponseItem {
   filename: string;
   score?: number;
   matches: SearchContext[];
+  /**
+   * How many matches the file had in all. Larger than `matches.length` when
+   * `maxMatchesPerFile` left some out.
+   */
+  totalMatches: number;
+}
+
+export interface SimpleSearchOptions {
+  /** Characters of context on each side of a match. Defaults to 100. */
+  contextLength?: number;
+  /** The most files to return, keeping the highest-scoring ones. Unlimited when absent. */
+  maxResults?: number;
+  /** The most matches to return for each file, in document order. Unlimited when absent. */
+  maxMatchesPerFile?: number;
+}
+
+export interface SimpleSearchResult {
+  results: SearchResponseItem[];
+  /** How many files matched in all. Larger than `results.length` when `maxResults` left some out. */
+  totalResults: number;
 }
 
 export interface SearchJsonResponseItem {
@@ -162,6 +234,12 @@ export interface FileMetadataObject {
   content: string;
   links: string[];
   backlinks: string[];
+  unresolvedLinks: string[];
+  /**
+   * The file's version token: the same value as its `ETag` and the document
+   * map's `version`, for use in `If-Match`. Present whenever `content` is.
+   */
+  version?: string;
 }
 
 export interface DocumentMapObject {
